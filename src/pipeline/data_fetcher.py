@@ -1,6 +1,5 @@
 """
-Professional Data Fetcher with Aggressive Rate Limiting
-Handles 429 errors gracefully with multiple fallback strategies
+Professional Data Fetcher with WebSocket Simulation & Advanced Caching
 """
 
 import yfinance as yf
@@ -15,71 +14,157 @@ import logging
 from functools import lru_cache
 import threading
 import json
+import asyncio
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """
-    Strict rate limiter to prevent 429 errors
-    """
-    def __init__(self, max_calls_per_minute=20):  # Reduced to 20/min to be safe
+    """Advanced rate limiter with adaptive throttling"""
+    
+    def __init__(self, max_calls_per_minute=30):
         self.max_calls_per_minute = max_calls_per_minute
-        self.calls = []
+        self.calls = deque()
         self.lock = threading.Lock()
+        self.adaptive_factor = 1.0
     
     def wait_if_needed(self):
-        """Wait if we've exceeded rate limit"""
         with self.lock:
             now = time.time()
             # Remove calls older than 1 minute
-            self.calls = [t for t in self.calls if now - t < 60]
+            while self.calls and now - self.calls[0] > 60:
+                self.calls.popleft()
             
-            if len(self.calls) >= self.max_calls_per_minute:
-                # Wait until we can make another call
-                oldest = min(self.calls)
-                wait_time = 60 - (now - oldest) + 2
+            if len(self.calls) >= self.max_calls_per_minute * self.adaptive_factor:
+                oldest = self.calls[0]
+                wait_time = 60 - (now - oldest) + random.uniform(0.5, 2)
                 logger.info(f"⏳ Rate limit reached. Waiting {wait_time:.1f}s...")
                 time.sleep(wait_time)
-                # Clear old calls after waiting
-                self.calls = []
+                self.calls.clear()
+                # Increase adaptive factor if we hit limit often
+                self.adaptive_factor = min(1.5, self.adaptive_factor * 1.1)
             
             self.calls.append(now)
+            # Gradually reduce adaptive factor
+            self.adaptive_factor = max(1.0, self.adaptive_factor * 0.99)
+
+
+class LivePriceSimulator:
+    """Simulates live price updates with realistic market behavior"""
+    
+    def __init__(self):
+        self.prices = {}
+        self.history = {}
+        self.volatility = {}
+        self.drift = {}
+        self.last_update = {}
+        self.is_running = False
+        self.thread = None
+        self.callbacks = []
+    
+    def start(self, tickers: List[str], initial_prices: Dict[str, float] = None):
+        """Start the live price simulator"""
+        self.is_running = True
+        
+        for ticker in tickers:
+            base_price = initial_prices.get(ticker, 100) if initial_prices else 100
+            self.prices[ticker] = base_price
+            self.volatility[ticker] = random.uniform(0.01, 0.03)
+            self.drift[ticker] = random.uniform(-0.0002, 0.0004)
+            self.history[ticker] = deque(maxlen=100)
+            self.last_update[ticker] = datetime.now()
+        
+        # Start background thread
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+    
+    def stop(self):
+        """Stop the simulator"""
+        self.is_running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+    
+    def _run(self):
+        """Background thread for price updates"""
+        while self.is_running:
+            for ticker in self.prices:
+                # Mean reversion
+                mean_price = self.prices[ticker]
+                noise = np.random.normal(0, self.volatility[ticker] * mean_price)
+                drift_term = self.drift[ticker] * mean_price
+                reversion = -0.001 * (self.prices[ticker] - mean_price)
+                
+                # Update price
+                new_price = self.prices[ticker] + drift_term + noise + reversion
+                new_price = max(new_price, 0.01)  # Ensure positive
+                
+                self.prices[ticker] = new_price
+                self.history[ticker].append({
+                    'time': datetime.now(),
+                    'price': new_price
+                })
+                self.last_update[ticker] = datetime.now()
+            
+            # Notify callbacks
+            for callback in self.callbacks:
+                try:
+                    callback(self.prices)
+                except Exception as e:
+                    logger.error(f"Callback error: {e}")
+            
+            time.sleep(0.5)  # Update every 500ms
+    
+    def register_callback(self, callback):
+        """Register a callback for price updates"""
+        self.callbacks.append(callback)
+    
+    def get_current_prices(self) -> Dict[str, float]:
+        """Get current simulated prices"""
+        return self.prices.copy()
+    
+    def get_history(self, ticker: str) -> List[Dict]:
+        """Get price history for a ticker"""
+        return list(self.history.get(ticker, []))
 
 
 class DataFetcher:
     """
-    Ultra-reliable financial data fetcher with aggressive rate limiting
+    Ultra-reliable financial data fetcher with live simulation
     """
 
-    def __init__(self):
-        # Strict rate limiting - 20 calls per minute max
-        self.rate_limiter = RateLimiter(max_calls_per_minute=20)
-        
-        # Data source tracking
+    def __init__(self, use_live_simulation: bool = False):
+        self.rate_limiter = RateLimiter(max_calls_per_minute=30)
         self.source_used = "Yahoo Finance"
         
-        # Cache for current prices - 30 minute cache to reduce calls
+        # Enhanced caching with TTL
         self.price_cache = {}
         self.cache_timestamp = {}
-        self.cache_duration = 1800  # 30 minutes
+        self.cache_duration = 60  # 1 minute for live data
         
-        # Cache for historical data - 6 hour cache
         self.historical_cache = {}
         self.historical_timestamp = {}
-        self.historical_cache_duration = 21600  # 6 hours
+        self.historical_cache_duration = 3600  # 1 hour
         
-        # Extended default prices for fallback
+        # Live simulation
+        self.use_live_simulation = use_live_simulation
+        self.live_simulator = LivePriceSimulator() if use_live_simulation else None
+        
+        # Default prices
         self.default_prices = self._load_default_prices()
         
-        # Track failed requests to avoid hammering
+        # Failed requests tracking
         self.failed_requests = {}
-        self.failed_cooldown = 3600  # 1 hour cooldown for failed tickers
+        self.failed_cooldown = 300  # 5 minutes
         
-        logger.info("✅ DataFetcher initialized with aggressive rate limiting")
+        # WebSocket-like event system
+        self._price_subscribers = []
+        
+        logger.info(f"✅ DataFetcher initialized (Live sim: {use_live_simulation})")
 
     def _load_default_prices(self) -> Dict[str, float]:
-        """Load extended default prices for global stocks"""
+        """Load extended default prices"""
         return {
             # US Stocks
             'AAPL': 175.32, 'MSFT': 380.45, 'GOOGL': 142.18,
@@ -93,50 +178,12 @@ class DataFetcher:
             'COST': 700.25, 'CVX': 155.40, 'WFC': 55.20,
             'QCOM': 165.30, 'TMO': 550.15, 'ABT': 110.25,
             
-            # Indian Stocks (NSE)
+            # Indian Stocks
             'RELIANCE.NS': 2500.00, 'TCS.NS': 3500.00, 'HDFCBANK.NS': 1600.00,
             'INFY.NS': 1450.00, 'ICICIBANK.NS': 1050.00, 'SBIN.NS': 600.00,
             'BHARTIARTL.NS': 850.00, 'ITC.NS': 400.00, 'WIPRO.NS': 500.00,
             'HINDUNILVR.NS': 2500.00, 'TITAN.NS': 2800.00, 'BAJFINANCE.NS': 7000.00,
             'MARUTI.NS': 9500.00, 'SUNPHARMA.NS': 1200.00, 'ONGC.NS': 150.00,
-            'NTPC.NS': 200.00, 'POWERGRID.NS': 220.00, 'ULTRACEMCO.NS': 8000.00,
-            'HCLTECH.NS': 1200.00, 'TECHM.NS': 1100.00, 'ASIANPAINT.NS': 3200.00,
-            'AXISBANK.NS': 1000.00, 'KOTAKBANK.NS': 1800.00, 'INDUSINDBK.NS': 1400.00,
-            
-            # Indian Stocks (BSE)
-            'RELIANCE.BO': 2495.00, 'TCS.BO': 3495.00, 'HDFCBANK.BO': 1595.00,
-            
-            # UK Stocks
-            'BP.L': 450.00, 'HSBA.L': 650.00, 'GSK.L': 1400.00,
-            'AZN.L': 10500.00, 'DGE.L': 2800.00, 'LLOY.L': 45.00,
-            'BARC.L': 150.00, 'VOD.L': 130.00, 'RIO.L': 5000.00,
-            'GLEN.L': 400.00, 'AAL.L': 2200.00, 'PRU.L': 800.00,
-            
-            # Canadian Stocks
-            'SHOP.TO': 90.00, 'RY.TO': 135.00, 'TD.TO': 82.00,
-            'ENB.TO': 50.00, 'CNR.TO': 160.00, 'CP.TO': 90.00,
-            'BNS.TO': 65.00, 'BMO.TO': 120.00, 'CM.TO': 60.00,
-            'SU.TO': 45.00, 'TRP.TO': 55.00, 'CVE.TO': 20.00,
-            
-            # European Stocks
-            'SAP.DE': 150.00, 'AIR.PA': 140.00, 'NESN.SW': 95.00,
-            'MC.PA': 700.00, 'OR.PA': 45.00, 'TTE.PA': 60.00,
-            'SAN.PA': 85.00, 'BNP.PA': 60.00, 'DBK.DE': 12.00,
-            'ALV.DE': 220.00, 'SIEGY': 150.00, 'VOW3.DE': 120.00,
-            'ASML.AS': 800.00, 'INGA.AS': 14.00, 'PHG.AS': 20.00,
-            
-            # Asian Stocks
-            '0700.HK': 350.00, '9988.HK': 80.00, '7203.T': 2500.00,
-            '005930.KS': 70000.00, 'BABA': 75.00, 'JD': 25.00,
-            'BIDU': 100.00, 'NTES': 90.00, 'TCEHY': 50.00,
-            'SFTBY': 25.00, 'NIO': 5.00, 'LI': 25.00,
-            'XPEV': 10.00, 'BILI': 12.00, 'IQ': 3.00,
-            
-            # ETFs
-            'SPY': 480.25, 'QQQ': 420.75, 'IWM': 210.50,
-            'VOO': 450.00, 'IVV': 470.00, 'VTI': 240.00,
-            'EFA': 75.00, 'EEM': 40.00, 'AGG': 95.00,
-            'GLD': 185.40, 'SLV': 22.00, 'TLT': 95.30,
             
             # Crypto
             'BTC-USD': 65000, 'ETH-USD': 3500, 'BNB-USD': 450,
@@ -144,97 +191,66 @@ class DataFetcher:
             'SOL-USD': 150.00, 'DOT-USD': 8.00, 'MATIC-USD': 0.80,
         }
 
-    def _is_rate_limited(self, ticker: str) -> bool:
-        """Check if a ticker is in cooldown due to rate limiting"""
-        if ticker in self.failed_requests:
-            cooldown_until = self.failed_requests[ticker]
-            if time.time() < cooldown_until:
-                return True
-            else:
-                # Clear expired cooldown
-                del self.failed_requests[ticker]
-        return False
+    def start_live_simulation(self, tickers: List[str]):
+        """Start live price simulation for tickers"""
+        if self.live_simulator:
+            # Get initial real prices if available
+            initial_prices = self.get_current_prices(tickers, force_refresh=True)
+            self.live_simulator.start(tickers, initial_prices)
+            self.source_used = "Live Simulation"
+            logger.info(f"🔄 Live simulation started for {len(tickers)} tickers")
 
-    def _mark_rate_limited(self, ticker: str):
-        """Mark a ticker as rate limited for cooldown"""
-        self.failed_requests[ticker] = time.time() + self.failed_cooldown
+    def stop_live_simulation(self):
+        """Stop live price simulation"""
+        if self.live_simulator:
+            self.live_simulator.stop()
+            logger.info("🔄 Live simulation stopped")
 
-    def _strict_rate_limit(self):
-        """Strict rate limiting - ensures we never hit Yahoo's limits"""
-        self.rate_limiter.wait_if_needed()
+    def subscribe_prices(self, callback):
+        """Subscribe to live price updates"""
+        if self.live_simulator:
+            self.live_simulator.register_callback(callback)
 
-    def _exponential_backoff(self, attempt: int) -> float:
-        """Calculate exponential backoff with jitter"""
-        base_delay = 5  # Start with 5 seconds
-        delay = base_delay * (2 ** attempt) + random.uniform(1, 5)
-        return min(delay, 60)  # Cap at 60 seconds
+    def get_live_prices(self) -> Dict[str, float]:
+        """Get current live prices"""
+        if self.live_simulator:
+            return self.live_simulator.get_current_prices()
+        return {}
 
-    def _fetch_with_retry(self, func, *args, ticker: str = None, **kwargs):
-        """
-        Generic fetch function with exponential backoff
-        """
-        max_retries = 3
-        
-        # Check if ticker is rate limited
-        if ticker and self._is_rate_limited(ticker):
-            logger.info(f"⏸️ {ticker} in cooldown, skipping")
-            return None
-        
-        for attempt in range(max_retries):
-            try:
-                self._strict_rate_limit()
-                result = func(*args, **kwargs)
-                
-                # If successful and ticker was rate limited, clear it
-                if ticker and ticker in self.failed_requests:
-                    del self.failed_requests[ticker]
-                
-                return result
-                
-            except Exception as e:
-                error_str = str(e)
-                logger.warning(f"⚠️ Attempt {attempt + 1} for {ticker or 'request'} failed: {error_str[:100]}")
-                
-                if "429" in error_str or "Too Many Requests" in error_str:
-                    # Mark ticker as rate limited
-                    if ticker:
-                        self._mark_rate_limited(ticker)
-                    
-                    # Exponential backoff
-                    delay = self._exponential_backoff(attempt)
-                    logger.info(f"⏳ Rate limited. Waiting {delay:.1f}s...")
-                    time.sleep(delay)
-                else:
-                    if attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1))
-        
-        return None
+    def get_price_history(self, ticker: str) -> List[Dict]:
+        """Get price history from live simulation"""
+        if self.live_simulator:
+            return self.live_simulator.get_history(ticker)
+        return []
 
     def get_historical_data(self, tickers_tuple: Tuple[str, ...], period: str = "1y") -> Optional[pd.DataFrame]:
-        """
-        Get historical data with aggressive caching
-        """
+        """Get historical data with enhanced caching"""
         cache_key = f"{tickers_tuple}_{period}"
         now = time.time()
         
-        # Check cache first
+        # Check cache
         if cache_key in self.historical_timestamp:
             if now - self.historical_timestamp[cache_key] < self.historical_cache_duration:
-                logger.info(f"📦 Using cached historical data for {len(tickers_tuple)} stocks")
+                logger.info(f"📦 Using cached historical data")
                 return self.historical_cache[cache_key]
         
         tickers = list(tickers_tuple)
         logger.info(f"📥 Fetching fresh historical data for {len(tickers)} stocks")
         
-        # Split into chunks to avoid rate limits
-        chunk_size = 3  # Fetch 3 tickers at a time
+        # Batch fetch with progress
+        chunk_size = 5
         all_data = []
+        total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
         
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i+chunk_size]
+            chunk_num = i // chunk_size + 1
             
-            def fetch_func():
-                return yf.download(
+            logger.info(f"  Fetching chunk {chunk_num}/{total_chunks}: {chunk}")
+            
+            try:
+                self.rate_limiter.wait_if_needed()
+                data = yf.download(
                     chunk,
                     period=period,
                     interval="1d",
@@ -243,79 +259,71 @@ class DataFetcher:
                     threads=False,
                     timeout=30
                 )
+                
+                if not data.empty:
+                    # Extract close prices
+                    if 'Close' in data.columns:
+                        if isinstance(data.columns, pd.MultiIndex):
+                            close_data = data['Close']
+                        else:
+                            close_data = data[['Close']]
+                        
+                        for col in close_data.columns:
+                            all_data.append(close_data[[col]])
+                
+                time.sleep(1)  # Delay between chunks
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch {chunk}: {e}")
+                # Use synthetic data for failed chunks
+                synthetic = self._generate_synthetic_data(chunk, period)
+                all_data.append(synthetic)
             
-            chunk_data = self._fetch_with_retry(fetch_func)
-            
-            if chunk_data is not None and not chunk_data.empty:
-                all_data.append(chunk_data)
-            
-            # Extra delay between chunks
-            if i + chunk_size < len(tickers):
-                time.sleep(3)
+            # Progress update
+            logger.info(f"  ✓ Chunk {chunk_num}/{total_chunks} complete")
         
         if not all_data:
-            logger.warning(f"⚠️ No data for {tickers}, using synthetic")
+            logger.warning(f"⚠️ No data available, using synthetic")
             return self._generate_synthetic_data(tickers, period)
         
-        # Combine all chunks
+        # Combine all data
         try:
-            # Handle different data formats
-            combined_data = pd.DataFrame()
+            combined = pd.concat(all_data, axis=1)
+            combined = combined.ffill().bfill()
             
-            for data in all_data:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if 'Close' in data.columns.levels[0]:
-                        close_data = data['Close']
-                    else:
-                        close_data = data.xs('Close', axis=1, level=0, drop_level=False)
-                else:
-                    if 'Close' in data.columns:
-                        close_data = data[['Close']]
-                        close_data.columns = [col for col in data.columns if col != 'Close']
-                    else:
-                        close_data = data
-                
-                for col in close_data.columns:
-                    combined_data[col] = close_data[col]
-            
-            combined_data = combined_data.ffill().bfill()
-            
-            # Cache the result
-            self.historical_cache[cache_key] = combined_data
+            # Cache
+            self.historical_cache[cache_key] = combined
             self.historical_timestamp[cache_key] = now
             self.source_used = "Yahoo Finance"
             
-            logger.info(f"✅ Successfully fetched data for {len(combined_data.columns)} stocks")
-            return combined_data
+            logger.info(f"✅ Successfully fetched data for {len(combined.columns)} stocks")
+            return combined
             
         except Exception as e:
-            logger.error(f"❌ Data cleaning failed: {e}")
+            logger.error(f"❌ Data combination failed: {e}")
             return self._generate_synthetic_data(tickers, period)
 
     def _generate_synthetic_data(self, tickers: List[str], period: str) -> pd.DataFrame:
-        """
-        Generate synthetic data when Yahoo fails
-        """
+        """Generate realistic synthetic data with correlations"""
         logger.info(f"🔄 Generating synthetic data for {tickers}")
         self.source_used = "Synthetic (Fallback)"
         
         days = self._period_to_days(period)
         dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
         
+        # Generate correlated returns
+        n_assets = len(tickers)
+        corr_matrix = np.eye(n_assets) * 0.7 + 0.3
+        L = np.linalg.cholesky(corr_matrix)
+        
+        returns = np.random.randn(days, n_assets) @ L.T * 0.02
+        returns = returns + 0.0003  # Drift
+        
         data = {}
-        for ticker in tickers:
+        for i, ticker in enumerate(tickers):
             base_price = self.default_prices.get(ticker, 100)
-            # Generate realistic random walk with mean reversion
-            returns = np.random.randn(days) * 0.02
-            # Add slight positive drift
-            returns = returns + 0.0003
-            # Add mean reversion
-            for i in range(1, len(returns)):
-                returns[i] = returns[i] - 0.01 * (np.sum(returns[:i]) / (i + 1))
-            
-            prices = base_price * np.exp(np.cumsum(returns))
-            # Ensure prices are positive
-            prices = np.maximum(prices, base_price * 0.5)
+            prices = base_price * np.exp(np.cumsum(returns[:, i]))
+            prices = np.maximum(prices, base_price * 0.3)
             data[ticker] = prices
         
         return pd.DataFrame(data, index=dates)
@@ -331,13 +339,17 @@ class DataFetcher:
         return 252
 
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """
-        Get current prices with 30-minute cache
-        """
+        """Get current prices with enhanced caching"""
+        # If using live simulation, return live prices
+        if self.live_simulator and self.live_simulator.is_running:
+            live_prices = self.live_simulator.get_current_prices()
+            if live_prices:
+                return live_prices
+        
         now = time.time()
         prices = {}
         
-        # Check cache first
+        # Check cache
         fresh_tickers = []
         stale_tickers = []
         
@@ -356,87 +368,74 @@ class DataFetcher:
         if stale_tickers:
             logger.info(f"📡 Fetching fresh prices for {len(stale_tickers)} stocks")
             
-            for ticker in stale_tickers:
-                price = self._fetch_single_price(ticker)
-                if price is not None:
-                    prices[ticker] = price
-                    self.price_cache[ticker] = price
-                    self.cache_timestamp[ticker] = now
-                else:
-                    # Fallback to default
-                    prices[ticker] = self.default_prices.get(ticker, 100)
-                    logger.info(f"📋 Using default price for {ticker}")
+            # Batch fetch
+            chunk_size = 5
+            for i in range(0, len(stale_tickers), chunk_size):
+                chunk = stale_tickers[i:i+chunk_size]
+                
+                try:
+                    self.rate_limiter.wait_if_needed()
+                    tickers_str = " ".join(chunk)
+                    data = yf.download(
+                        tickers_str,
+                        period="1d",
+                        interval="1m",
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                        timeout=10
+                    )
+                    
+                    if not data.empty and 'Close' in data.columns:
+                        if isinstance(data.columns, pd.MultiIndex):
+                            close_data = data['Close']
+                        else:
+                            close_data = data[['Close']]
+                        
+                        for ticker in chunk:
+                            if ticker in close_data.columns:
+                                price = close_data[ticker].iloc[-1]
+                                if price and price > 0:
+                                    prices[ticker] = float(price)
+                                    self.price_cache[ticker] = float(price)
+                                    self.cache_timestamp[ticker] = now
+                                    continue
+                    
+                    # Fallback for missing tickers
+                    for ticker in chunk:
+                        if ticker not in prices:
+                            prices[ticker] = self.default_prices.get(ticker, 100)
+                            self.price_cache[ticker] = prices[ticker]
+                            self.cache_timestamp[ticker] = now
+                            
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to fetch prices for {chunk}: {e}")
+                    for ticker in chunk:
+                        if ticker not in prices:
+                            prices[ticker] = self.default_prices.get(ticker, 100)
+                
+                time.sleep(1)  # Delay between chunks
         
         return prices
 
-    def _fetch_single_price(self, ticker: str) -> Optional[float]:
-        """
-        Fetch price for a single ticker with aggressive retry logic
-        """
-        def fetch_func():
-            stock = yf.Ticker(ticker)
-            
-            # Try multiple price sources
-            try:
-                # Try fast info first (fewer API calls)
-                fast_info = stock.fast_info
-                price = fast_info.get("last_price")
-                if price and price > 0:
-                    return float(price)
-            except:
-                pass
-            
-            # Wait a bit before trying full info
-            time.sleep(1)
-            
-            # Fallback to regular info
-            try:
-                info = stock.info
-                price = (
-                    info.get("currentPrice") or
-                    info.get("regularMarketPrice") or
-                    info.get("ask") or
-                    info.get("bid") or
-                    info.get("previousClose")
-                )
-                
-                if price and price > 0:
-                    return float(price)
-            except:
-                pass
-            
-            return None
-        
-        result = self._fetch_with_retry(fetch_func, ticker=ticker)
-        
-        if result:
-            self.source_used = "Yahoo Finance (Live)"
-            logger.info(f"✅ Fetched {ticker}: {result:.2f}")
-        else:
-            logger.warning(f"❌ Could not fetch {ticker}")
-        
-        return result
-
     def get_option_chain(self, ticker: str) -> Dict:
-        """
-        Fetch option chain for US stocks only
-        """
-        # Skip non-US stocks and rate-limited tickers
-        if '.' in ticker or self._is_rate_limited(ticker):
+        """Fetch option chain with better formatting"""
+        if '.' in ticker or ticker in self.failed_requests:
             return {}
         
-        def fetch_func():
+        try:
+            self.rate_limiter.wait_if_needed()
             stock = yf.Ticker(ticker)
+            expirations = stock.options
             
-            try:
-                expirations = stock.options
-                if not expirations:
-                    return {}
+            if not expirations:
+                return {}
+            
+            # Get nearest 3 expirations
+            chain_data = {}
+            for exp in expirations[:3]:
+                chain = stock.option_chain(exp)
                 
-                # Get nearest expiration
-                chain = stock.option_chain(expirations[0])
-                
-                # Format the data
                 calls = []
                 for _, row in chain.calls.head(10).iterrows():
                     calls.append({
@@ -445,6 +444,7 @@ class DataFetcher:
                         'bid': float(row.get('bid', 0)),
                         'ask': float(row.get('ask', 0)),
                         'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                        'openInterest': int(row.get('openInterest', 0)) if pd.notna(row.get('openInterest')) else 0,
                         'impliedVolatility': float(row.get('impliedVolatility', 0))
                     })
                 
@@ -456,23 +456,57 @@ class DataFetcher:
                         'bid': float(row.get('bid', 0)),
                         'ask': float(row.get('ask', 0)),
                         'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                        'openInterest': int(row.get('openInterest', 0)) if pd.notna(row.get('openInterest')) else 0,
                         'impliedVolatility': float(row.get('impliedVolatility', 0))
                     })
                 
-                return {
+                chain_data[exp] = {
                     'calls': calls,
                     'puts': puts,
-                    'expiration': expirations[0],
                     'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
                 }
-                
-            except Exception as e:
-                logger.warning(f"Option chain error for {ticker}: {e}")
-                return {}
-        
-        result = self._fetch_with_retry(fetch_func, ticker=ticker)
-        return result or {}
+            
+            return chain_data
+            
+        except Exception as e:
+            logger.warning(f"Option chain error for {ticker}: {e}")
+            self.failed_requests[ticker] = time.time() + 300
+            return {}
 
     def get_data_source_info(self) -> str:
         """Get info about data source used"""
+        if self.live_simulator and self.live_simulator.is_running:
+            return "Live Simulation + Yahoo Finance"
         return self.source_used
+
+    def get_market_summary(self) -> Dict:
+        """Get market summary with key indices"""
+        indices = {
+            '^GSPC': 'S&P 500',
+            '^IXIC': 'NASDAQ',
+            '^DJI': 'Dow Jones',
+            '^FTSE': 'FTSE 100',
+            '^NSEI': 'NIFTY 50',
+            '^BSESN': 'SENSEX',
+            'BTC-USD': 'Bitcoin',
+            'ETH-USD': 'Ethereum'
+        }
+        
+        summary = {}
+        for symbol, name in indices.items():
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                price = info.get('regularMarketPrice') or info.get('currentPrice')
+                if price:
+                    change = info.get('regularMarketChangePercent', 0)
+                    summary[name] = {
+                        'symbol': symbol,
+                        'price': float(price),
+                        'change': float(change),
+                        'direction': 'up' if change > 0 else 'down'
+                    }
+            except:
+                pass
+        
+        return summary

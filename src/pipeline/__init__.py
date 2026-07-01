@@ -2,11 +2,12 @@
 Pipeline module for Monte Carlo simulations
 """
 
-from src.pipeline.monte_carlo_pipeline import MonteCarloPipeline
 from src.pipeline.data_fetcher import DataFetcher
 from src.pipeline.feature_engineering import FeatureEngineer, FeatureConfig
 from src.pipeline.risk.metrics import RiskCalculator
 from src.pipeline.risk.confidence import ConfidenceIntervalCalculator
+from src.pipeline.monte_carlo_pipeline import MonteCarloPipeline
+from src.pipeline.portfolio_optimizer import PortfolioOptimizer, FactorModel
 
 # Try to import optional modules
 try:
@@ -26,12 +27,14 @@ except ImportError:
     PEMC_AVAILABLE = False
 
 __all__ = [
-    'MonteCarloPipeline',
     'DataFetcher',
     'FeatureEngineer',
     'FeatureConfig',
     'RiskCalculator',
-    'ConfidenceIntervalCalculator'
+    'ConfidenceIntervalCalculator',
+    'MonteCarloPipeline',
+    'PortfolioOptimizer',
+    'FactorModel'
 ]
 
 # Add optional modules to __all__ if available
