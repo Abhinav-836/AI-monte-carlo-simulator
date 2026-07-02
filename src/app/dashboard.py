@@ -16,29 +16,6 @@ import time
 import json
 import random
 from dotenv import load_dotenv
-import yfinance as yf
-
-# DEBUG: Check what secrets are available on Streamlit Cloud
-try:
-    import streamlit as st
-    print("=" * 50)
-    print("🔍 SECRETS DEBUG INFO")
-    print("=" * 50)
-    if hasattr(st, 'secrets'):
-        print(f"📋 Secrets type: {type(st.secrets)}")
-        print(f"📋 Secrets keys: {list(st.secrets.keys())}")
-        for key in st.secrets.keys():
-            value = st.secrets[key]
-            if 'API' in key or 'KEY' in key:
-                print(f"   {key}: {str(value)[:10]}... (length: {len(str(value))})")
-            else:
-                print(f"   {key}: {value}")
-    else:
-        print("❌ st.secrets not available")
-    print("=" * 50)
-except Exception as e:
-    print(f"❌ Error reading secrets: {e}")
-
 
 # Load environment variables
 load_dotenv(override=True)
@@ -48,7 +25,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
 
 # Import pipeline
 try:
@@ -65,23 +41,6 @@ except ImportError:
     LlamaExplainer = None
     print("⚠️ LlamaExplainer not available")
 
-# Debug: Check API key status
-def check_api_key():
-    try:
-        if hasattr(st, 'secrets'):
-            keys_found = list(st.secrets.keys())
-            print(f"📋 Secrets keys found: {keys_found}")
-            
-            if 'ALPHA_VANTAGE_API_KEY' in st.secrets:
-                key = st.secrets['ALPHA_VANTAGE_API_KEY']
-                print(f"✅ ALPHA_VANTAGE_API_KEY found: {key[:8]}...")
-            else:
-                print("❌ ALPHA_VANTAGE_API_KEY NOT in secrets")
-    except Exception as e:
-        print(f"❌ Error reading secrets: {e}")
-
-# Call this when app starts
-check_api_key()
 
 def run_dashboard():
     """Main function to run the dashboard"""
@@ -115,6 +74,8 @@ def run_dashboard():
         st.session_state.auto_refresh = False
     if 'simulation_running' not in st.session_state:
         st.session_state.simulation_running = False
+    if 'prices_fetched' not in st.session_state:
+        st.session_state.prices_fetched = False
 
     # ===================== DARK THEME CSS =====================
     st.markdown("""
@@ -288,21 +249,82 @@ def run_dashboard():
             return f"${value/1e3:.2f}K"
         return f"${value:.2f}"
 
-    def fetch_live_prices(tickers):
-        """Fetch real-time prices with caching"""
+    def fetch_live_prices_from_pipeline(tickers):
+        """Fetch real-time prices using the data fetcher (Finnhub first)"""
         prices = {}
         try:
+            if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
+                fetcher = st.session_state.pipeline.data_fetcher
+                # Get prices using the data fetcher (Finnhub -> Alpha Vantage -> Default)
+                fetched = fetcher.get_current_prices(tickers, force_refresh=True)
+                if fetched:
+                    for ticker in tickers:
+                        prices[ticker] = fetched.get(ticker, 100 + random.uniform(-10, 10))
+                    print(f"✅ Live prices from pipeline: {prices}")
+                    return prices
+        except Exception as e:
+            print(f"⚠️ Error fetching from pipeline: {e}")
+        
+        # Fallback: Try direct Finnhub calls
+        try:
+            import requests
+            finnhub_key = None
+            try:
+                if hasattr(st, 'secrets') and 'FINNHUB_API_KEY' in st.secrets:
+                    finnhub_key = st.secrets['FINNHUB_API_KEY']
+            except:
+                pass
+            
+            if finnhub_key:
+                for ticker in tickers:
+                    try:
+                        url = "https://finnhub.io/api/v1/quote"
+                        params = {"symbol": ticker, "token": finnhub_key}
+                        response = requests.get(url, params=params, timeout=10)
+                        if response.status_code == 200:
+                            data = response.json()
+                            price = data.get('c', 0)
+                            if price and price > 0:
+                                prices[ticker] = float(price)
+                                continue
+                    except:
+                        pass
+                    prices[ticker] = 100 + random.uniform(-10, 10)
+                return prices
+        except:
+            pass
+        
+        # Ultimate fallback: random prices
+        for ticker in tickers:
+            prices[ticker] = 100 + random.uniform(-10, 10)
+        return prices
+
+    def fetch_live_prices(tickers):
+        """Fetch real-time prices with caching - uses pipeline if available"""
+        prices = {}
+        
+        # If pipeline exists with data fetcher, use it
+        if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
+            return fetch_live_prices_from_pipeline(tickers)
+        
+        # Fallback to Yahoo Finance
+        try:
+            import yfinance as yf
             for ticker in tickers:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('ask') or info.get('previousClose')
-                if price:
-                    prices[ticker] = float(price)
-                else:
+                try:
+                    stock = yf.Ticker(ticker)
+                    info = stock.info
+                    price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('ask') or info.get('previousClose')
+                    if price:
+                        prices[ticker] = float(price)
+                    else:
+                        prices[ticker] = 100 + random.uniform(-10, 10)
+                except:
                     prices[ticker] = 100 + random.uniform(-10, 10)
         except:
             for ticker in tickers:
                 prices[ticker] = 100 + random.uniform(-10, 10)
+        
         return prices
 
     def simulate_live_update(tickers):
@@ -418,18 +440,64 @@ def run_dashboard():
             st.session_state.last_refresh = datetime.now()
             st.cache_data.clear()
             st.session_state.live_prices = {}
+            st.session_state.prices_fetched = False
             safe_rerun()
         
         st.caption(f"Tracking: {len(stocks)} assets")
 
+    # ===================== INITIALIZE PIPELINE =====================
+    if st.session_state.pipeline is None and stocks:
+        with st.spinner("Initializing AI Engine..."):
+            try:
+                pipeline = MonteCarloPipeline(
+                    n_assets=len(stocks),
+                    n_simulations=n_sims,
+                    filter_top_k=filter_pct,
+                    use_gan=use_gan,
+                    use_live_data=True
+                )
+                pipeline.load_models()
+                st.session_state.pipeline = pipeline
+                st.session_state.error_message = None
+                
+                # After pipeline is initialized, fetch live prices immediately
+                if pipeline.data_fetcher:
+                    live_prices = fetch_live_prices_from_pipeline(stocks)
+                    if live_prices:
+                        st.session_state.live_prices = live_prices
+                        st.session_state.prices_fetched = True
+                        print(f"✅ Initial live prices loaded: {live_prices}")
+                
+                st.success("✅ AI Engine Ready!")
+                time.sleep(0.5)
+                safe_rerun()
+            except Exception as e:
+                st.session_state.error_message = str(e)
+                st.error(f"Initialization failed: {e}")
+
     # ===================== LIVE PRICE TICKER =====================
-    if stocks and (st.session_state.auto_refresh or not st.session_state.live_prices):
+    if stocks and (st.session_state.auto_refresh or not st.session_state.prices_fetched or not st.session_state.live_prices):
         with st.spinner("Fetching live prices..."):
             try:
-                if st.session_state.live_prices:
-                    st.session_state.live_prices = simulate_live_update(stocks)
+                # Try to get fresh prices from pipeline
+                if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
+                    fresh_prices = fetch_live_prices_from_pipeline(stocks)
+                    if fresh_prices:
+                        st.session_state.live_prices = fresh_prices
+                        st.session_state.prices_fetched = True
+                        print(f"✅ Live prices updated: {fresh_prices}")
+                    else:
+                        # Fallback to simulation
+                        if st.session_state.live_prices:
+                            st.session_state.live_prices = simulate_live_update(stocks)
+                        else:
+                            st.session_state.live_prices = fetch_live_prices(stocks)
                 else:
-                    st.session_state.live_prices = fetch_live_prices(stocks)
+                    # No pipeline yet, use fallback
+                    if st.session_state.live_prices:
+                        st.session_state.live_prices = simulate_live_update(stocks)
+                    else:
+                        st.session_state.live_prices = fetch_live_prices(stocks)
                 
                 # Store history
                 for ticker in stocks:
@@ -440,10 +508,10 @@ def run_dashboard():
                             'time': datetime.now(),
                             'price': st.session_state.live_prices[ticker]
                         })
-                    # Keep last 100 points
                     if len(st.session_state.price_history[ticker]) > 100:
                         st.session_state.price_history[ticker] = st.session_state.price_history[ticker][-100:]
             except Exception as e:
+                print(f"⚠️ Error in live price ticker: {e}")
                 pass
 
     # ===================== LIVE PRICE DISPLAY =====================
@@ -470,27 +538,6 @@ def run_dashboard():
                     <div style="font-size: 0.9rem; color: {color};">{arrow} {change:+.2f}%</div>
                 </div>
                 """, unsafe_allow_html=True)
-
-    # ===================== INITIALIZE PIPELINE =====================
-    if st.session_state.pipeline is None and stocks:
-        with st.spinner("Initializing AI Engine..."):
-            try:
-                pipeline = MonteCarloPipeline(
-                    n_assets=len(stocks),
-                    n_simulations=n_sims,
-                    filter_top_k=filter_pct,
-                    use_gan=use_gan,
-                    use_live_data=True
-                )
-                pipeline.load_models()
-                st.session_state.pipeline = pipeline
-                st.session_state.error_message = None
-                st.success("✅ AI Engine Ready!")
-                time.sleep(0.5)
-                safe_rerun()
-            except Exception as e:
-                st.session_state.error_message = str(e)
-                st.error(f"Initialization failed: {e}")
 
     # ===================== RUN SIMULATION =====================
     if run_button and st.session_state.pipeline and stocks:
@@ -555,17 +602,14 @@ def run_dashboard():
         
         # Calculate actual variance reduction
         variance_reduction = results.get('variance_reduction', 0)
-        # If variance reduction is 0, try to calculate it from the data
         if variance_reduction == 0 and 'path_sample' in results:
             paths = np.array(results['path_sample'])
             if paths.size > 0:
-                # Calculate variance of paths
                 path_returns = np.diff(np.log(paths + 1e-8), axis=1)
                 var_sim = np.var(path_returns.flatten())
-                # Use a benchmark variance (could be from historical data)
-                var_bench = var_sim * 1.5  # Approximate benchmark
+                var_bench = var_sim * 1.5
                 variance_reduction = max(0, (var_bench - var_sim) / (var_bench + 1e-8))
-                variance_reduction = min(0.95, variance_reduction)  # Cap at 95%
+                variance_reduction = min(0.95, variance_reduction)
         
         # Metrics Row
         st.markdown("### 📊 Live Stats")
@@ -604,7 +648,6 @@ def run_dashboard():
                 ci = confidence_intervals.get(stock, [0, 0])
                 risk = risk_metrics.get(stock, {})
                 
-                # Trend indicators
                 if change > 10:
                     trend = "🚀 Strong Bullish"
                 elif change > 3:
@@ -646,7 +689,6 @@ def run_dashboard():
         if "path_sample" in results and results["path_sample"]:
             paths = np.array(results["path_sample"])
             
-            # Enhanced tabs
             tabs = st.tabs(["📊 Price Paths", "📉 Distribution", "📋 Options", "🔮 Risk Analysis", "📊 Portfolio"])
             
             with tabs[0]:
@@ -674,14 +716,12 @@ def run_dashboard():
                             color = colors[i % len(colors)]
                             
                             if show_confidence:
-                                # Confidence band
                                 fig.add_trace(go.Scatter(
                                     x=list(range(len(mean_path))), 
                                     y=upper,
                                     line=dict(width=0), 
                                     showlegend=False, 
-                                    hoverinfo='skip',
-                                    name=f'{stock} Upper'
+                                    hoverinfo='skip'
                                 ))
                                 fig.add_trace(go.Scatter(
                                     x=list(range(len(mean_path))), 
@@ -690,11 +730,9 @@ def run_dashboard():
                                     fillcolor=f'rgba{tuple(int(color.lstrip("#")[j:j+2], 16) for j in (0,2,4)) + (0.15,)}',
                                     line=dict(width=0), 
                                     showlegend=False, 
-                                    hoverinfo='skip',
-                                    name=f'{stock} Lower'
+                                    hoverinfo='skip'
                                 ))
                             
-                            # Mean line
                             fig.add_trace(go.Scatter(
                                 x=list(range(len(mean_path))), 
                                 y=mean_path,
@@ -704,7 +742,6 @@ def run_dashboard():
                             ))
                             
                             if show_individual and len(paths) > 0:
-                                # Show individual paths (sample)
                                 for j in range(min(5, len(paths))):
                                     fig.add_trace(go.Scatter(
                                         x=list(range(len(paths[j, :, idx]))),
@@ -755,7 +792,6 @@ def run_dashboard():
                                [{"secondary_y": False}, {"secondary_y": False}]]
                     )
                     
-                    # Histogram
                     fig.add_trace(go.Histogram(
                         x=final_prices, 
                         nbinsx=50, 
@@ -764,7 +800,6 @@ def run_dashboard():
                         opacity=0.7
                     ), row=1, col=1)
                     
-                    # Box plot
                     fig.add_trace(go.Box(
                         y=final_prices, 
                         name=stock, 
@@ -773,7 +808,6 @@ def run_dashboard():
                         boxpoints='outliers'
                     ), row=1, col=2)
                     
-                    # Density (KDE)
                     from scipy import stats
                     kde = stats.gaussian_kde(final_prices)
                     x_range = np.linspace(final_prices.min(), final_prices.max(), 100)
@@ -787,7 +821,6 @@ def run_dashboard():
                         fillcolor='rgba(236, 72, 153, 0.1)'
                     ), row=2, col=1)
                     
-                    # QQ Plot
                     sorted_prices = np.sort(final_prices)
                     theoretical = stats.norm.ppf(np.linspace(0.01, 0.99, len(sorted_prices)))
                     fig.add_trace(go.Scatter(
@@ -798,7 +831,6 @@ def run_dashboard():
                         marker=dict(color='#10b981', size=4, opacity=0.6)
                     ), row=2, col=2)
                     
-                    # Add reference line
                     min_val = min(theoretical.min(), sorted_prices.min())
                     max_val = max(theoretical.max(), sorted_prices.max())
                     fig.add_trace(go.Scatter(
@@ -841,7 +873,6 @@ def run_dashboard():
             with tabs[3]:
                 st.markdown("### 📊 Risk Metrics Dashboard")
                 
-                # Risk metrics table
                 risk_data = []
                 for stock in stocks[:paths.shape[2]]:
                     risk = risk_metrics.get(stock, {})
@@ -860,22 +891,19 @@ def run_dashboard():
                     df_risk = pd.DataFrame(risk_data)
                     st.dataframe(df_risk, use_container_width=True, hide_index=True)
                 
-                # Risk heatmap - FIXED VERSION
                 st.markdown("#### Risk-Return Heatmap")
                 if risk_data:
                     df_heat = pd.DataFrame(risk_data)
                     df_heat['Return'] = df_heat['Expected Return'].str.rstrip('%').astype(float)
                     df_heat['Risk'] = df_heat['Volatility'].str.rstrip('%').astype(float)
                     df_heat['Sharpe'] = df_heat['Sharpe'].astype(float)
-                    
-                    # Fix: Ensure size is positive by using absolute value
-                    df_heat['Size'] = df_heat['Sharpe'].abs() * 10 + 5  # Scale for better visibility
+                    df_heat['Size'] = df_heat['Sharpe'].abs() * 10 + 5
                     
                     fig = px.scatter(
                         df_heat,
                         x="Risk",
                         y="Return",
-                        size="Size",  # Use positive size values
+                        size="Size",
                         color="Sharpe",
                         text="Asset",
                         title="Risk-Return Tradeoff",
@@ -898,13 +926,11 @@ def run_dashboard():
                 st.markdown("### 📊 Portfolio Analysis")
                 
                 if len(stocks) >= 2:
-                    # Efficient frontier
                     n_portfolios = 1000
                     returns_list = []
                     volatilities = []
                     sharpe_ratios = []
                     
-                    # Get returns and volatilities
                     asset_returns = []
                     asset_vols = []
                     for stock in stocks[:paths.shape[2]]:
@@ -917,7 +943,6 @@ def run_dashboard():
                         asset_returns = np.array(asset_returns)
                         asset_vols = np.array(asset_vols)
                         
-                        # Correlation matrix
                         corr_matrix = np.eye(len(asset_returns)) * 0.7 + 0.3
                         cov_matrix = np.outer(asset_vols, asset_vols) * corr_matrix
                         
@@ -935,7 +960,6 @@ def run_dashboard():
                         
                         fig = go.Figure()
                         
-                        # Scatter plot
                         fig.add_trace(go.Scatter(
                             x=volatilities,
                             y=returns_list,
@@ -950,7 +974,6 @@ def run_dashboard():
                             name='Portfolios'
                         ))
                         
-                        # Find optimal
                         best_idx = np.argmax(sharpe_ratios)
                         fig.add_trace(go.Scatter(
                             x=[volatilities[best_idx]],
@@ -973,7 +996,6 @@ def run_dashboard():
                         )
                         st.plotly_chart(fig, use_container_width=True)
                         
-                        # Show optimal weights
                         st.markdown("#### Optimal Portfolio Weights")
                         optimal_weights = np.random.random(len(asset_returns))
                         optimal_weights /= np.sum(optimal_weights)
