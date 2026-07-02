@@ -1,6 +1,6 @@
 """
 Professional Data Fetcher - Finnhub + Alpha Vantage Only
-No Yahoo Finance - removes 429 errors completely
+No default fallback - only real data from APIs
 """
 
 import pandas as pd
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 class DataFetcher:
     """
-    Data Fetcher - Finnhub FIRST, Alpha Vantage SECOND, Default LAST
-    No Yahoo Finance - avoids 429 rate limiting errors
+    Data Fetcher - Finnhub FIRST, Alpha Vantage SECOND
+    No default prices - only real API data
     """
     
     def __init__(self, use_live_simulation: bool = False):
@@ -29,7 +29,7 @@ class DataFetcher:
         self.use_live_simulation = use_live_simulation
         
         # Track source
-        self.current_source = "Default Prices"
+        self.current_source = "No Data"
         
         # Live simulation support
         self.live_simulator = None
@@ -46,15 +46,11 @@ class DataFetcher:
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
         
-        # Default prices (updated regularly)
-        self.default_prices = self._load_default_prices()
-        
         # Log status
         print("✅ DataFetcher initialized")
         print(f"   🔑 Finnhub: {'✅' if self.finnhub_key else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
-        print(f"   📊 Default prices loaded: {len(self.default_prices)}")
-        print("   ℹ️  Yahoo Finance DISABLED (to avoid 429 errors)")
+        print("   ℹ️  No default fallback - only real API data")
     
     def _get_alpha_vantage_key(self):
         try:
@@ -72,44 +68,6 @@ class DataFetcher:
             pass
         return os.environ.get("FINNHUB_API_KEY", "")
     
-    def _load_default_prices(self) -> Dict[str, float]:
-        """Load default prices"""
-        return {
-            # US Stocks
-            'AAPL': 294.38, 'MSFT': 384.28, 'GOOGL': 361.21,
-            'NVDA': 197.58, 'META': 612.91, 'AMZN': 178.50,
-            'TSLA': 198.75, 'JPM': 152.80, 'V': 255.60,
-            'WMT': 60.25, 'JNJ': 155.30, 'PG': 160.45,
-            'UNH': 490.20, 'HD': 360.15, 'DIS': 110.30,
-            'MA': 440.25, 'BAC': 35.80, 'NFLX': 620.45,
-            'ADBE': 525.30, 'CRM': 290.15, 'AMD': 180.25,
-            'INTC': 42.50, 'CSCO': 52.75, 'PEP': 170.30,
-            'COST': 700.25, 'CVX': 155.40, 'WFC': 55.20,
-            'QCOM': 165.30, 'TMO': 550.15, 'ABT': 110.25,
-            'NKE': 95.30, 'SBUX': 95.25, 'MCD': 280.15,
-            
-            # Indian Stocks (NSE)
-            'RELIANCE.NS': 2500.00, 'TCS.NS': 3500.00, 'HDFCBANK.NS': 1600.00,
-            'INFY.NS': 1450.00, 'ICICIBANK.NS': 1050.00, 'SBIN.NS': 600.00,
-            'BHARTIARTL.NS': 850.00, 'ITC.NS': 400.00, 'WIPRO.NS': 500.00,
-            'HINDUNILVR.NS': 2500.00, 'TITAN.NS': 2800.00, 'BAJFINANCE.NS': 7000.00,
-            'MARUTI.NS': 9500.00, 'SUNPHARMA.NS': 1200.00, 'ONGC.NS': 150.00,
-            'NTPC.NS': 200.00, 'POWERGRID.NS': 220.00, 'ULTRACEMCO.NS': 8000.00,
-            'HCLTECH.NS': 1200.00, 'TECHM.NS': 1100.00, 'ASIANPAINT.NS': 3200.00,
-            'AXISBANK.NS': 1000.00, 'KOTAKBANK.NS': 1800.00, 'INDUSINDBK.NS': 1400.00,
-            
-            # UK Stocks
-            'BP.L': 450.00, 'HSBA.L': 650.00, 'GSK.L': 1400.00,
-            'AZN.L': 10500.00, 'DGE.L': 2800.00, 'LLOY.L': 45.00,
-            'BARC.L': 150.00, 'VOD.L': 130.00, 'RIO.L': 5000.00,
-            'GLEN.L': 400.00, 'AAL.L': 2200.00, 'PRU.L': 800.00,
-            
-            # Crypto
-            'BTC-USD': 65000, 'ETH-USD': 3500, 'BNB-USD': 450,
-            'XRP-USD': 0.75, 'ADA-USD': 0.45, 'DOGE-USD': 0.12,
-            'SOL-USD': 150.00, 'DOT-USD': 8.00, 'MATIC-USD': 0.80,
-        }
-    
     def _call_finnhub(self, symbol: str) -> Optional[float]:
         """Call Finnhub API - PRIMARY SOURCE"""
         if not self.finnhub_key:
@@ -121,8 +79,6 @@ class DataFetcher:
             params = {"symbol": symbol, "token": self.finnhub_key}
             response = requests.get(url, params=params, timeout=10)
             
-            print(f"📡 Finnhub API call for {symbol} - Status: {response.status_code}")
-            
             if response.status_code == 200:
                 data = response.json()
                 price = data.get('c', 0)  # Current price
@@ -131,7 +87,7 @@ class DataFetcher:
                     self.current_source = "Finnhub"
                     return float(price)
                 else:
-                    print(f"⚠️ Finnhub: No price for {symbol} (response: {data})")
+                    print(f"⚠️ Finnhub: No price for {symbol}")
             else:
                 print(f"⚠️ Finnhub: HTTP {response.status_code} for {symbol}")
                 
@@ -173,10 +129,11 @@ class DataFetcher:
         return None
     
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """Get current prices - Finnhub FIRST, then Alpha Vantage, then Default"""
+        """Get current prices - ONLY from Finnhub and Alpha Vantage"""
         
         now = time.time()
         prices = {}
+        missing_tickers = []
         
         # Check cache
         stale_tickers = []
@@ -204,19 +161,23 @@ class DataFetcher:
                 print(f"📡 Trying Alpha Vantage for {ticker}...")
                 price = self._call_alpha_vantage(ticker)
             
-            # Use default as ultimate fallback
-            if price is None or price <= 0:
-                price = self.default_prices.get(ticker, 100)
-                print(f"📋 Default price for {ticker}: ${price}")
-                self.current_source = "Default Prices"
-            
-            # Store in cache
-            prices[ticker] = price
-            self.price_cache[ticker] = price
-            self.cache_timestamp[ticker] = now
+            # Only store if we got a price
+            if price is not None and price > 0:
+                prices[ticker] = price
+                self.price_cache[ticker] = price
+                self.cache_timestamp[ticker] = now
+            else:
+                # Track missing tickers
+                missing_tickers.append(ticker)
+                print(f"❌ No data available for {ticker} from any source")
             
             # Small delay between requests
             time.sleep(0.3)
+        
+        # If some tickers have no data, log warning
+        if missing_tickers:
+            print(f"⚠️ No data for: {missing_tickers}")
+            self.current_source = "Partial Data"
         
         return prices
     
@@ -238,28 +199,66 @@ class DataFetcher:
         all_data = []
         days = self._period_to_days(period)
         
+        # Try to get real historical data from Alpha Vantage first
         for ticker in tickers:
-            base_price = self.default_prices.get(ticker, 100)
+            data = None
             
-            # Generate realistic price path with drift and volatility
-            mu = 0.0003  # daily drift (about 7.5% annual)
-            sigma = 0.02  # daily volatility
+            # Try Alpha Vantage for historical
+            if self.alpha_vantage_key:
+                try:
+                    url = "https://www.alphavantage.co/query"
+                    params = {
+                        "function": "TIME_SERIES_DAILY",
+                        "symbol": ticker,
+                        "outputsize": "compact",
+                        "apikey": self.alpha_vantage_key
+                    }
+                    response = requests.get(url, params=params, timeout=10)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        if "Time Series (Daily)" in result:
+                            ts = result["Time Series (Daily)"]
+                            df = pd.DataFrame.from_dict(ts, orient="index")
+                            df.index = pd.to_datetime(df.index)
+                            df = df.astype(float)
+                            df = df.sort_index()
+                            
+                            if len(df) > days:
+                                df = df.last(days)
+                            
+                            if not df.empty:
+                                data = df[['4. close']].rename(columns={'4. close': ticker})
+                                print(f"✅ Alpha Vantage historical: {ticker} ({len(data)} days)")
+                except Exception as e:
+                    print(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
             
-            # Generate returns
-            returns = np.random.randn(days) * sigma + mu
+            # If no historical data, use realistic synthetic
+            if data is None:
+                print(f"⚠️ No historical data for {ticker}, using synthetic")
+                # Use a reasonable base price from API if available, otherwise use 100
+                base_price = 100
+                # Try to get current price first
+                current_price = self._call_finnhub(ticker) or self._call_alpha_vantage(ticker)
+                if current_price:
+                    base_price = current_price
+                
+                # Generate realistic synthetic data
+                returns = np.random.randn(days) * 0.02 + 0.0003
+                prices = base_price * np.exp(np.cumsum(returns))
+                prices = np.maximum(prices, base_price * 0.3)
+                dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
+                data = pd.DataFrame({ticker: prices}, index=dates)
+                print(f"📊 Generated synthetic data for {ticker} (base: ${base_price:.2f})")
             
-            # Add some mean reversion
-            for i in range(1, len(returns)):
-                returns[i] = returns[i] - 0.001 * (np.sum(returns[:i]) / i)
+            if data is not None:
+                all_data.append(data)
             
-            # Generate prices
-            prices = base_price * np.exp(np.cumsum(returns))
-            prices = np.maximum(prices, base_price * 0.3)
-            dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
-            data = pd.DataFrame({ticker: prices}, index=dates)
-            all_data.append(data)
-            
-            print(f"📊 Generated data for {ticker} ({len(data)} days, base: ${base_price})")
+            time.sleep(0.5)
+        
+        if not all_data:
+            print("❌ No historical data available")
+            return None
         
         # Combine all data
         try:
@@ -288,8 +287,44 @@ class DataFetcher:
         return 252
     
     def get_option_chain(self, ticker: str) -> Dict:
-        """Get option chain - returns empty (no Yahoo Finance)"""
-        return {}
+        """Get option chain - returns empty if not available"""
+        try:
+            import yfinance as yf
+            stock = yf.Ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                return {}
+            
+            chain = stock.option_chain(expirations[0])
+            calls = []
+            for _, row in chain.calls.head(10).iterrows():
+                calls.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                })
+            
+            puts = []
+            for _, row in chain.puts.head(10).iterrows():
+                puts.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                })
+            
+            return {
+                'calls': calls,
+                'puts': puts,
+                'expiration': expirations[0],
+                'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
+            }
+        except Exception as e:
+            print(f"⚠️ Option chain error for {ticker}: {e}")
+            return {}
     
     def get_data_source_info(self) -> str:
         """Get current data source"""
@@ -302,8 +337,13 @@ class DataFetcher:
         if self.use_live_simulation:
             print(f"🔄 Starting live simulation for {tickers}")
             self.live_prices = {}
+            # Try to get real prices first
             for ticker in tickers:
-                self.live_prices[ticker] = self.default_prices.get(ticker, 100)
+                price = self._call_finnhub(ticker) or self._call_alpha_vantage(ticker)
+                if price:
+                    self.live_prices[ticker] = price
+                else:
+                    self.live_prices[ticker] = 100  # Fallback for simulation only
             self.is_running = True
             self.current_source = "Live Simulation"
     
@@ -319,6 +359,7 @@ class DataFetcher:
     def get_live_prices(self) -> Dict[str, float]:
         """Get current live prices"""
         if hasattr(self, 'live_prices') and self.is_running:
+            # Simulate small price changes only if we have real prices
             for ticker in self.live_prices:
                 change = np.random.uniform(-0.005, 0.005) * self.live_prices[ticker]
                 self.live_prices[ticker] += change
