@@ -27,21 +27,6 @@ project_root = os.path.abspath(os.path.join(current_dir, "../.."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Debug: Check if API key is loaded
-# Check secrets
-if hasattr(st, 'secrets'):
-    if 'ALPHA_VANTAGE_API_KEY' in st.secrets:
-        print(f"✅ Secrets found: {st.secrets['ALPHA_VANTAGE_API_KEY'][:8]}...")
-    else:
-        print("❌ No ALPHA_VANTAGE_API_KEY in secrets")
-
-# Check environment
-api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-if api_key:
-    print(f"✅ Environment: {api_key[:8]}...")
-else:
-    print("❌ No ALPHA_VANTAGE_API_KEY in environment")
-
 
 # Import pipeline
 try:
