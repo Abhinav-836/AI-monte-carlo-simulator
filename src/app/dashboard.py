@@ -1,6 +1,6 @@
 """
 Ultra-Modern Monte Carlo Dashboard - Premium Edition v2.0
-Dark Theme Only - Advanced Analytics
+Dark Theme Only - Advanced Analytics with Full Backend Visibility
 """
 
 import streamlit as st
@@ -16,6 +16,7 @@ import time
 import json
 import random
 from dotenv import load_dotenv
+import yfinance as yf
 
 # Load environment variables
 load_dotenv(override=True)
@@ -76,6 +77,10 @@ def run_dashboard():
         st.session_state.simulation_running = False
     if 'prices_fetched' not in st.session_state:
         st.session_state.prices_fetched = False
+    if 'simulation_logs' not in st.session_state:
+        st.session_state.simulation_logs = []
+    if 'show_logs' not in st.session_state:
+        st.session_state.show_logs = False
 
     # ===================== DARK THEME CSS =====================
     st.markdown("""
@@ -176,6 +181,39 @@ def run_dashboard():
             color: white;
         }
         
+        .log-container {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 12px;
+            padding: 1rem;
+            font-family: 'Courier New', monospace;
+            font-size: 0.8rem;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .log-line {
+            color: #94a3b8;
+            padding: 2px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+        }
+        
+        .log-line.success {
+            color: #10b981;
+        }
+        
+        .log-line.error {
+            color: #ef4444;
+        }
+        
+        .log-line.warning {
+            color: #f59e0b;
+        }
+        
+        .log-line.info {
+            color: #60a5fa;
+        }
+        
         ::-webkit-scrollbar {
             width: 8px;
             height: 8px;
@@ -225,6 +263,12 @@ def run_dashboard():
             background: rgba(255, 255, 255, 0.05);
             border-radius: 12px;
         }
+        
+        .progress-text {
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-top: 0.5rem;
+        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -249,67 +293,45 @@ def run_dashboard():
             return f"${value/1e3:.2f}K"
         return f"${value:.2f}"
 
+    def add_log(message, log_type="info"):
+        """Add a log message to session state"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = {
+            "time": timestamp,
+            "message": message,
+            "type": log_type
+        }
+        if 'simulation_logs' not in st.session_state:
+            st.session_state.simulation_logs = []
+        st.session_state.simulation_logs.append(log_entry)
+        # Keep only last 100 logs
+        if len(st.session_state.simulation_logs) > 100:
+            st.session_state.simulation_logs = st.session_state.simulation_logs[-100:]
+
     def fetch_live_prices_from_pipeline(tickers):
-        """Fetch real-time prices using the data fetcher (Finnhub first)"""
+        """Fetch real-time prices using the data fetcher"""
         prices = {}
         try:
             if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
                 fetcher = st.session_state.pipeline.data_fetcher
-                # Get prices using the data fetcher (Finnhub -> Alpha Vantage -> Default)
                 fetched = fetcher.get_current_prices(tickers, force_refresh=True)
                 if fetched:
                     for ticker in tickers:
                         prices[ticker] = fetched.get(ticker, 100 + random.uniform(-10, 10))
-                    print(f"✅ Live prices from pipeline: {prices}")
                     return prices
         except Exception as e:
             print(f"⚠️ Error fetching from pipeline: {e}")
-        
-        # Fallback: Try direct Finnhub calls
-        try:
-            import requests
-            finnhub_key = None
-            try:
-                if hasattr(st, 'secrets') and 'FINNHUB_API_KEY' in st.secrets:
-                    finnhub_key = st.secrets['FINNHUB_API_KEY']
-            except:
-                pass
-            
-            if finnhub_key:
-                for ticker in tickers:
-                    try:
-                        url = "https://finnhub.io/api/v1/quote"
-                        params = {"symbol": ticker, "token": finnhub_key}
-                        response = requests.get(url, params=params, timeout=10)
-                        if response.status_code == 200:
-                            data = response.json()
-                            price = data.get('c', 0)
-                            if price and price > 0:
-                                prices[ticker] = float(price)
-                                continue
-                    except:
-                        pass
-                    prices[ticker] = 100 + random.uniform(-10, 10)
-                return prices
-        except:
-            pass
-        
-        # Ultimate fallback: random prices
-        for ticker in tickers:
-            prices[ticker] = 100 + random.uniform(-10, 10)
         return prices
 
     def fetch_live_prices(tickers):
-        """Fetch real-time prices with caching - uses pipeline if available"""
+        """Fetch real-time prices with caching"""
         prices = {}
         
-        # If pipeline exists with data fetcher, use it
         if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
             return fetch_live_prices_from_pipeline(tickers)
         
         # Fallback to Yahoo Finance
         try:
-            import yfinance as yf
             for ticker in tickers:
                 try:
                     stock = yf.Ticker(ticker)
@@ -429,6 +451,13 @@ def run_dashboard():
             value=True
         )
         
+        # Show logs checkbox
+        show_logs = st.checkbox(
+            "📝 Show Backend Logs",
+            value=st.session_state.show_logs
+        )
+        st.session_state.show_logs = show_logs
+        
         # Run button
         run_button = st.button(
             "🚀 RUN SIMULATION",
@@ -441,6 +470,7 @@ def run_dashboard():
             st.cache_data.clear()
             st.session_state.live_prices = {}
             st.session_state.prices_fetched = False
+            st.session_state.simulation_logs = []
             safe_rerun()
         
         st.caption(f"Tracking: {len(stocks)} assets")
@@ -449,6 +479,7 @@ def run_dashboard():
     if st.session_state.pipeline is None and stocks:
         with st.spinner("Initializing AI Engine..."):
             try:
+                add_log("🚀 Initializing Monte Carlo Pipeline...", "info")
                 pipeline = MonteCarloPipeline(
                     n_assets=len(stocks),
                     n_simulations=n_sims,
@@ -456,44 +487,44 @@ def run_dashboard():
                     use_gan=use_gan,
                     use_live_data=True
                 )
+                add_log("📦 Loading ML models...", "info")
                 pipeline.load_models()
                 st.session_state.pipeline = pipeline
                 st.session_state.error_message = None
+                add_log("✅ AI Engine Ready!", "success")
                 
                 # After pipeline is initialized, fetch live prices immediately
                 if pipeline.data_fetcher:
+                    add_log("📡 Fetching live prices...", "info")
                     live_prices = fetch_live_prices_from_pipeline(stocks)
                     if live_prices:
                         st.session_state.live_prices = live_prices
                         st.session_state.prices_fetched = True
-                        print(f"✅ Initial live prices loaded: {live_prices}")
+                        add_log(f"✅ Live prices loaded: {live_prices}", "success")
                 
                 st.success("✅ AI Engine Ready!")
                 time.sleep(0.5)
                 safe_rerun()
             except Exception as e:
                 st.session_state.error_message = str(e)
+                add_log(f"❌ Initialization failed: {e}", "error")
                 st.error(f"Initialization failed: {e}")
 
     # ===================== LIVE PRICE TICKER =====================
     if stocks and (st.session_state.auto_refresh or not st.session_state.prices_fetched or not st.session_state.live_prices):
         with st.spinner("Fetching live prices..."):
             try:
-                # Try to get fresh prices from pipeline
                 if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
                     fresh_prices = fetch_live_prices_from_pipeline(stocks)
                     if fresh_prices:
                         st.session_state.live_prices = fresh_prices
                         st.session_state.prices_fetched = True
-                        print(f"✅ Live prices updated: {fresh_prices}")
                     else:
-                        # Fallback to simulation
                         if st.session_state.live_prices:
                             st.session_state.live_prices = simulate_live_update(stocks)
                         else:
                             st.session_state.live_prices = fetch_live_prices(stocks)
                 else:
-                    # No pipeline yet, use fallback
                     if st.session_state.live_prices:
                         st.session_state.live_prices = simulate_live_update(stocks)
                     else:
@@ -522,7 +553,6 @@ def run_dashboard():
         for i, ticker in enumerate(stocks[:8]):
             with cols[i]:
                 price = st.session_state.live_prices.get(ticker, 0)
-                # Calculate change
                 history = st.session_state.price_history.get(ticker, [])
                 change = 0
                 if len(history) >= 2:
@@ -539,9 +569,15 @@ def run_dashboard():
                 </div>
                 """, unsafe_allow_html=True)
 
-    # ===================== RUN SIMULATION =====================
+    # ===================== RUN SIMULATION WITH FULL LOGS =====================
     if run_button and st.session_state.pipeline and stocks:
         st.session_state.simulation_running = True
+        st.session_state.simulation_logs = []  # Clear previous logs
+        
+        add_log("🚀 Starting simulation...", "info")
+        add_log(f"📊 Assets: {stocks}", "info")
+        add_log(f"📈 Paths: {n_sims}, Period: {period}", "info")
+        
         with st.spinner("AI simulating market scenarios..."):
             try:
                 pipeline = st.session_state.pipeline
@@ -549,31 +585,39 @@ def run_dashboard():
                 pipeline.filter_top_k = filter_pct
                 pipeline.use_gan = use_gan
                 
-                # Show progress
+                # Show progress with detailed steps
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Run simulation
+                # Define progress steps with detailed messages
+                progress_steps = [
+                    (5, "📊 Fetching historical data..."),
+                    (10, "📊 Analyzing market patterns..."),
+                    (20, "📈 Calculating covariance matrices..."),
+                    (30, "🔄 Generating price paths..."),
+                    (40, "🔄 Running Monte Carlo simulations..."),
+                    (50, "🎯 Filtering most realistic paths..."),
+                    (60, "📊 Computing expected prices..."),
+                    (70, "📉 Calculating risk metrics (VaR, CVaR)..."),
+                    (80, "📊 Computing Sharpe and Sortino ratios..."),
+                    (90, "📊 Analyzing portfolio statistics..."),
+                    (95, "📊 Generating final results..."),
+                    (100, "✅ Simulation Complete!")
+                ]
+                
+                # Run simulation in background
                 results = pipeline.run_simulation(
                     tickers=stocks,
                     period=period,
                     use_real_options=include_options
                 )
                 
-                # Update progress
-                messages = [
-                    "Analyzing market patterns...",
-                    "Generating paths...",
-                    "Running Monte Carlo...",
-                    "Optimizing portfolio...",
-                    "Calculating risk metrics..."
-                ]
-                
-                for i in range(100):
-                    progress_bar.progress(i + 1)
-                    if i % 20 == 0:
-                        status_text.text(random.choice(messages))
-                    time.sleep(0.01)
+                # Update progress with detailed messages
+                for progress, message in progress_steps:
+                    progress_bar.progress(progress / 100)
+                    status_text.text(message)
+                    add_log(message, "info")
+                    time.sleep(0.1)
                 
                 progress_bar.empty()
                 status_text.empty()
@@ -583,12 +627,40 @@ def run_dashboard():
                 st.session_state.error_message = None
                 st.session_state.simulation_running = False
                 
+                add_log("✅ Simulation Complete!", "success")
+                
+                # Log results summary
+                metadata = results.get("metadata", {})
+                add_log(f"📊 Generated {metadata.get('n_simulations', 0)} paths", "info")
+                add_log(f"🎯 Filtered to {metadata.get('filtered_paths', 0)} paths", "info")
+                add_log(f"⏱️ Computation time: {metadata.get('computation_time', 0):.2f}s", "info")
+                
                 st.success("✅ Simulation Complete!")
                 
             except Exception as e:
                 st.session_state.error_message = str(e)
+                add_log(f"❌ Simulation failed: {e}", "error")
                 st.error(f"Simulation failed: {e}")
                 st.session_state.simulation_running = False
+
+    # ===================== DISPLAY BACKEND LOGS =====================
+    if st.session_state.show_logs and st.session_state.simulation_logs:
+        st.markdown('<div class="section-header">📝 Backend Logs</div>', unsafe_allow_html=True)
+        
+        log_html = '<div class="log-container">'
+        for log in st.session_state.simulation_logs[-50:]:  # Show last 50 logs
+            log_type = log.get("type", "info")
+            color_class = {
+                "success": "success",
+                "error": "error", 
+                "warning": "warning",
+                "info": "info"
+            }.get(log_type, "info")
+            
+            log_html += f'<div class="log-line {color_class}">[{log.get("time", "")}] {log.get("message", "")}</div>'
+        log_html += '</div>'
+        
+        st.markdown(log_html, unsafe_allow_html=True)
 
     # ===================== DISPLAY RESULTS =====================
     if st.session_state.results:
@@ -808,8 +880,7 @@ def run_dashboard():
                         boxpoints='outliers'
                     ), row=1, col=2)
                     
-                    from scipy import stats
-                    kde = stats.gaussian_kde(final_prices)
+                    from scipy import stats                    kde = stats.gaussian_kde(final_prices)
                     x_range = np.linspace(final_prices.min(), final_prices.max(), 100)
                     fig.add_trace(go.Scatter(
                         x=x_range, 
@@ -869,6 +940,7 @@ def run_dashboard():
                                         st.dataframe(df_puts, use_container_width=True)
                 else:
                     st.info("No options data available for selected assets")
+                    st.info("💡 Try US stocks like AAPL, MSFT, GOOGL for options data")
             
             with tabs[3]:
                 st.markdown("### 📊 Risk Metrics Dashboard")
@@ -1015,6 +1087,7 @@ def run_dashboard():
                 with st.spinner("AI analyzing market data..."):
                     try:
                         if LlamaExplainer:
+                            add_log("🤖 Generating AI insights...", "info")
                             explainer = LlamaExplainer()
                             explanation = explainer.explain_simulation_results(
                                 tickers=stocks,
@@ -1024,9 +1097,11 @@ def run_dashboard():
                                 variance_reduction=variance_reduction
                             )
                             st.session_state.explanation = explanation
+                            add_log("✅ AI insights generated", "success")
                         else:
                             st.warning("LLM explainer not available")
                     except Exception as e:
+                        add_log(f"❌ AI analysis failed: {e}", "error")
                         st.error(f"AI analysis failed: {e}")
         
         with col_ai2:
