@@ -1,6 +1,6 @@
 """
 Professional Data Fetcher with Multiple Data Sources
-Prioritizes Finnhub for reliable data on Streamlit Cloud
+Finnhub PRIORITY for reliable data on Streamlit Cloud
 """
 
 import yfinance as yf
@@ -19,18 +19,17 @@ logger = logging.getLogger(__name__)
 
 class DataFetcher:
     """
-    Data Fetcher with multiple data sources - Finnhub prioritized
+    Data Fetcher - Finnhub FIRST, then Alpha Vantage, then Yahoo Finance
     """
     
     def __init__(self, use_live_simulation: bool = False):
         # Get API keys
         self.alpha_vantage_key = self._get_alpha_vantage_key()
         self.finnhub_key = self._get_finnhub_key()
-        self.twelve_data_key = self._get_twelve_data_key()
         self.use_live_simulation = use_live_simulation
         
         # Track source
-        self.current_source = "Synthetic (Initial)"
+        self.current_source = "Default Prices"
         
         # Live simulation support
         self.live_simulator = None
@@ -50,15 +49,14 @@ class DataFetcher:
         # Default prices (updated regularly)
         self.default_prices = self._load_default_prices()
         
-        # Rate limiting
-        self.last_call = {}
-        self.call_interval = 0.5
+        # Rate limiting for Yahoo
+        self.last_yahoo_call = 0
         
         # Log status
         print("✅ DataFetcher initialized")
         print(f"   🔑 Finnhub: {'✅' if self.finnhub_key else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
-        print(f"   🔑 Twelve Data: {'✅' if self.twelve_data_key else '❌'}")
+        print(f"   📊 Default prices loaded: {len(self.default_prices)}")
     
     def _get_alpha_vantage_key(self):
         try:
@@ -76,35 +74,37 @@ class DataFetcher:
             pass
         return os.environ.get("FINNHUB_API_KEY", "")
     
-    def _get_twelve_data_key(self):
-        try:
-            if hasattr(st, 'secrets') and 'TWELVEDATA_API_KEY' in st.secrets:
-                return st.secrets['TWELVEDATA_API_KEY']
-        except:
-            pass
-        return os.environ.get("TWELVEDATA_API_KEY", "")
-    
     def _load_default_prices(self) -> Dict[str, float]:
         """Load default prices"""
         return {
+            # US Stocks
             'AAPL': 294.38, 'MSFT': 384.28, 'GOOGL': 361.21,
             'NVDA': 197.58, 'META': 612.91, 'AMZN': 178.50,
             'TSLA': 198.75, 'JPM': 152.80, 'V': 255.60,
+            'WMT': 60.25, 'JNJ': 155.30, 'PG': 160.45,
+            # Crypto
             'BTC-USD': 65000, 'ETH-USD': 3500, 'BNB-USD': 450,
             'SOL-USD': 150.00,
+            # Indian Stocks
             'RELIANCE.NS': 2500.00, 'TCS.NS': 3500.00,
             'HDFCBANK.NS': 1600.00, 'INFY.NS': 1450.00,
+            'ICICIBANK.NS': 1050.00,
+            # UK Stocks
+            'BP.L': 450.00, 'HSBA.L': 650.00, 'GSK.L': 1400.00,
         }
     
     def _call_finnhub(self, symbol: str) -> Optional[float]:
-        """Call Finnhub API for price - PRIORITY 1"""
+        """Call Finnhub API - PRIMARY SOURCE"""
         if not self.finnhub_key:
+            print(f"⚠️ No Finnhub API key for {symbol}")
             return None
         
         try:
             url = "https://finnhub.io/api/v1/quote"
             params = {"symbol": symbol, "token": self.finnhub_key}
             response = requests.get(url, params=params, timeout=10)
+            
+            print(f"📡 Finnhub API call for {symbol} - Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
@@ -113,15 +113,18 @@ class DataFetcher:
                     print(f"✅ Finnhub: {symbol} = ${price}")
                     self.current_source = "Finnhub"
                     return float(price)
+                else:
+                    print(f"⚠️ Finnhub: No price for {symbol} (response: {data})")
             else:
-                print(f"⚠️ Finnhub status {response.status_code} for {symbol}")
+                print(f"⚠️ Finnhub: HTTP {response.status_code} for {symbol}")
+                
         except Exception as e:
             print(f"⚠️ Finnhub error for {symbol}: {e}")
         
         return None
     
     def _call_alpha_vantage(self, symbol: str) -> Optional[float]:
-        """Call Alpha Vantage API - PRIORITY 2"""
+        """Call Alpha Vantage API - SECONDARY SOURCE"""
         if not self.alpha_vantage_key:
             return None
         
@@ -148,31 +151,15 @@ class DataFetcher:
         
         return None
     
-    def _call_twelve_data(self, symbol: str) -> Optional[float]:
-        """Call Twelve Data API - PRIORITY 3"""
-        if not self.twelve_data_key:
-            return None
-        
-        try:
-            url = "https://api.twelvedata.com/price"
-            params = {"symbol": symbol, "apikey": self.twelve_data_key}
-            response = requests.get(url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                price = data.get('price')
-                if price:
-                    print(f"✅ Twelve Data: {symbol} = ${price}")
-                    self.current_source = "Twelve Data"
-                    return float(price)
-        except Exception as e:
-            print(f"⚠️ Twelve Data error for {symbol}: {e}")
-        
-        return None
-    
     def _call_yahoo_finance(self, symbol: str) -> Optional[float]:
-        """Call Yahoo Finance - PRIORITY 4 (LAST RESORT)"""
+        """Call Yahoo Finance - LAST RESORT"""
         try:
+            # Rate limit Yahoo calls
+            now = time.time()
+            if now - self.last_yahoo_call < 1:
+                time.sleep(1)
+            self.last_yahoo_call = time.time()
+            
             stock = yf.Ticker(symbol)
             info = stock.info
             price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -186,7 +173,7 @@ class DataFetcher:
         return None
     
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """Get current prices - Finnhub first, then fallbacks"""
+        """Get current prices - Finnhub FIRST, then fallbacks"""
         
         now = time.time()
         prices = {}
@@ -203,40 +190,24 @@ class DataFetcher:
         if not stale_tickers:
             return prices
         
-        print(f"📡 Fetching prices for: {stale_tickers}")
+        print(f"📡 Fetching fresh prices for: {stale_tickers}")
         
         for ticker in stale_tickers:
             price = None
             
-            # Try data sources in order - FINNHUB FIRST
-            sources = [
-                ("Finnhub", self._call_finnhub),
-                ("Alpha Vantage", self._call_alpha_vantage),
-                ("Twelve Data", self._call_twelve_data),
-                ("Yahoo Finance", self._call_yahoo_finance)
-            ]
+            # TRY FINNHUB FIRST (Primary)
+            print(f"📡 Trying Finnhub for {ticker}...")
+            price = self._call_finnhub(ticker)
             
-            for source_name, source_func in sources:
-                if price is None:
-                    try:
-                        # Check if we should use this source
-                        if source_name == "Finnhub" and not self.finnhub_key:
-                            continue
-                        if source_name == "Alpha Vantage" and not self.alpha_vantage_key:
-                            continue
-                        if source_name == "Twelve Data" and not self.twelve_data_key:
-                            continue
-                        
-                        price = source_func(ticker)
-                        if price and price > 0:
-                            print(f"✅ {source_name}: {ticker} = ${price}")
-                            break
-                    except Exception as e:
-                        print(f"⚠️ {source_name} error for {ticker}: {e}")
-                        continue
-                
-                # Small delay between attempts
-                time.sleep(0.3)
+            # If Finnhub fails, try Alpha Vantage
+            if price is None:
+                print(f"📡 Trying Alpha Vantage for {ticker}...")
+                price = self._call_alpha_vantage(ticker)
+            
+            # If both fail, try Yahoo Finance
+            if price is None:
+                print(f"📡 Trying Yahoo Finance for {ticker}...")
+                price = self._call_yahoo_finance(ticker)
             
             # Use default as ultimate fallback
             if price is None or price <= 0:
@@ -248,6 +219,9 @@ class DataFetcher:
             prices[ticker] = price
             self.price_cache[ticker] = price
             self.cache_timestamp[ticker] = now
+            
+            # Small delay between requests
+            time.sleep(0.3)
         
         return prices
     
@@ -272,7 +246,7 @@ class DataFetcher:
         for ticker in tickers:
             data = None
             
-            # Try Yahoo Finance first for historical
+            # Try Yahoo Finance for historical (it's best for historical)
             try:
                 yf_data = yf.download(
                     ticker,
@@ -285,9 +259,9 @@ class DataFetcher:
                 )
                 if not yf_data.empty and 'Close' in yf_data.columns:
                     data = yf_data[['Close']].rename(columns={'Close': ticker})
-                    print(f"✅ Yahoo Finance: {ticker} ({len(data)} days)")
+                    print(f"✅ Yahoo Finance historical: {ticker} ({len(data)} days)")
             except Exception as e:
-                print(f"⚠️ Yahoo failed for {ticker}: {e}")
+                print(f"⚠️ Yahoo historical failed for {ticker}: {e}")
             
             # Generate synthetic as last resort
             if data is None:
@@ -332,7 +306,7 @@ class DataFetcher:
         return 252
     
     def get_option_chain(self, ticker: str) -> Dict:
-        """Get option chain (Yahoo Finance)"""
+        """Get option chain"""
         try:
             stock = yf.Ticker(ticker)
             expirations = stock.options
