@@ -35,6 +35,7 @@ class DataFetcher:
         self.live_simulator = None
         self._price_subscribers = []
         self.is_running = False
+        self.live_prices = {}
         
         # Cache
         self.price_cache = {}
@@ -48,34 +49,48 @@ class DataFetcher:
         # Default prices
         self.default_prices = self._load_default_prices()
         
-        logger.info(f"✅ DataFetcher initialized (Alpha Vantage: {'✓' if self.alpha_vantage_key else '✗'})")
+        # Log API key status
+        if self.alpha_vantage_key:
+            logger.info(f"✅ Alpha Vantage API key found: {self.alpha_vantage_key[:8]}...")
+        else:
+            logger.warning("⚠️ No Alpha Vantage API key found - using fallback only")
     
     def _get_api_key(self):
         """Get Alpha Vantage API key from various sources"""
-        # Try Streamlit secrets first
-        try:
-            if hasattr(st, 'secrets') and 'ALPHA_VANTAGE_API_KEY' in st.secrets:
-                key = st.secrets['ALPHA_VANTAGE_API_KEY']
-                if key and key != "your_alpha_vantage_api_key_here":
-                    return key
-        except:
-            pass
+        api_key = None
         
-        # Try environment variables
+        # 1. Try Streamlit secrets (for cloud deployment)
+        try:
+            if hasattr(st, 'secrets'):
+                if 'ALPHA_VANTAGE_API_KEY' in st.secrets:
+                    key = st.secrets['ALPHA_VANTAGE_API_KEY']
+                    if key and key != "your_alpha_vantage_api_key_here":
+                        api_key = key
+                        logger.info("✅ API key found in Streamlit secrets")
+                        return api_key
+        except Exception as e:
+            logger.warning(f"Error reading Streamlit secrets: {e}")
+        
+        # 2. Try environment variables
         key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
         if key and key != "your_alpha_vantage_api_key_here":
-            return key
+            api_key = key
+            logger.info("✅ API key found in environment variables")
+            return api_key
         
-        # Try .env file
+        # 3. Try .env file
         try:
             from dotenv import load_dotenv
             load_dotenv()
             key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
             if key and key != "your_alpha_vantage_api_key_here":
-                return key
-        except:
-            pass
+                api_key = key
+                logger.info("✅ API key found in .env file")
+                return api_key
+        except Exception as e:
+            logger.warning(f"Error loading .env: {e}")
         
+        logger.warning("⚠️ No Alpha Vantage API key found")
         return None
     
     def _load_default_prices(self) -> Dict[str, float]:
@@ -156,6 +171,7 @@ class DataFetcher:
                         self.price_cache[ticker] = float(price)
                         self.cache_timestamp[ticker] = now
                         self.current_source = "Alpha Vantage"
+                        logger.info(f"✅ Alpha Vantage: {ticker} = ${price}")
                         continue
                 
                 # If Alpha Vantage fails, try Yahoo
@@ -168,15 +184,17 @@ class DataFetcher:
                         self.price_cache[ticker] = float(price)
                         self.cache_timestamp[ticker] = now
                         self.current_source = "Yahoo Finance"
+                        logger.info(f"✅ Yahoo Finance: {ticker} = ${price}")
                         continue
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Yahoo failed for {ticker}: {e}")
                 
                 # Ultimate fallback: default price
                 prices[ticker] = self.default_prices.get(ticker, 100)
                 self.price_cache[ticker] = prices[ticker]
                 self.cache_timestamp[ticker] = now
                 self.current_source = "Default (Fallback)"
+                logger.info(f"⚠️ Default price for {ticker}: ${prices[ticker]}")
         
         return prices
     
@@ -351,7 +369,7 @@ class DataFetcher:
     
     def get_live_prices(self) -> Dict[str, float]:
         """Get current live prices"""
-        if hasattr(self, 'live_prices'):
+        if hasattr(self, 'live_prices') and self.is_running:
             # Simulate small price changes
             for ticker in self.live_prices:
                 change = np.random.uniform(-0.005, 0.005) * self.live_prices[ticker]
