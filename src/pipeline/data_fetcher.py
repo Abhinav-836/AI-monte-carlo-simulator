@@ -1,6 +1,6 @@
 """
 Professional Data Fetcher with Alpha Vantage Primary + Yahoo Finance Fallback
-Optimized for Streamlit Cloud deployment
+FIXED for Streamlit Cloud - Proper secrets handling with debugging
 """
 
 import yfinance as yf
@@ -51,46 +51,60 @@ class DataFetcher:
         
         # Log API key status
         if self.alpha_vantage_key:
-            logger.info(f"✅ Alpha Vantage API key found: {self.alpha_vantage_key[:8]}...")
+            print(f"✅ Alpha Vantage API key loaded: {self.alpha_vantage_key[:8]}...")
+            logger.info(f"✅ Alpha Vantage API key loaded: {self.alpha_vantage_key[:8]}...")
         else:
+            print("⚠️ No Alpha Vantage API key found - using fallback only")
             logger.warning("⚠️ No Alpha Vantage API key found - using fallback only")
     
     def _get_api_key(self):
         """Get Alpha Vantage API key from various sources"""
         api_key = None
         
-        # 1. Try Streamlit secrets (for cloud deployment)
+        # 1. FIRST: Try Streamlit secrets (for cloud deployment)
         try:
             if hasattr(st, 'secrets'):
+                print(f"📋 Checking Streamlit secrets... Keys: {list(st.secrets.keys())}")
                 if 'ALPHA_VANTAGE_API_KEY' in st.secrets:
                     key = st.secrets['ALPHA_VANTAGE_API_KEY']
-                    if key and key != "your_alpha_vantage_api_key_here":
-                        api_key = key
-                        logger.info("✅ API key found in Streamlit secrets")
-                        return api_key
+                    if isinstance(key, str):
+                        key = key.strip().strip('"').strip("'")
+                        if key and len(key) > 10:
+                            api_key = key
+                            print(f"✅ API key found in Streamlit secrets: {key[:8]}...")
+                            logger.info(f"✅ API key found in Streamlit secrets: {key[:8]}...")
+                            return api_key
         except Exception as e:
+            print(f"Error reading Streamlit secrets: {e}")
             logger.warning(f"Error reading Streamlit secrets: {e}")
         
         # 2. Try environment variables
         key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-        if key and key != "your_alpha_vantage_api_key_here":
-            api_key = key
-            logger.info("✅ API key found in environment variables")
-            return api_key
+        if key:
+            key = key.strip().strip('"').strip("'")
+            if key and len(key) > 10:
+                api_key = key
+                print(f"✅ API key found in environment: {key[:8]}...")
+                logger.info(f"✅ API key found in environment: {key[:8]}...")
+                return api_key
         
-        # 3. Try .env file
+        # 3. Try .env file (local development)
         try:
             from dotenv import load_dotenv
             load_dotenv()
             key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-            if key and key != "your_alpha_vantage_api_key_here":
-                api_key = key
-                logger.info("✅ API key found in .env file")
-                return api_key
+            if key:
+                key = key.strip().strip('"').strip("'")
+                if key and len(key) > 10:
+                    api_key = key
+                    print(f"✅ API key found in .env: {key[:8]}...")
+                    logger.info(f"✅ API key found in .env: {key[:8]}...")
+                    return api_key
         except Exception as e:
+            print(f"Error loading .env: {e}")
             logger.warning(f"Error loading .env: {e}")
         
-        logger.warning("⚠️ No Alpha Vantage API key found")
+        print("⚠️ No Alpha Vantage API key found")
         return None
     
     def _load_default_prices(self) -> Dict[str, float]:
@@ -108,6 +122,7 @@ class DataFetcher:
     def _call_alpha_vantage(self, symbol: str, function: str = "GLOBAL_QUOTE") -> Optional[Dict]:
         """Call Alpha Vantage API"""
         if not self.alpha_vantage_key:
+            print(f"❌ No Alpha Vantage API key available for {symbol}")
             return None
         
         try:
@@ -121,31 +136,42 @@ class DataFetcher:
             if function == "TIME_SERIES_DAILY":
                 params["outputsize"] = "compact"
             
+            print(f"📡 Calling Alpha Vantage API for {symbol}...")
             response = requests.get(url, params=params, timeout=15)
+            
+            print(f"📡 Response status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
                 
                 # Check for API errors
                 if "Note" in data:
+                    print(f"⚠️ Alpha Vantage rate limit: {data['Note']}")
                     logger.warning(f"Alpha Vantage rate limit: {data['Note']}")
                     return None
                 if "Error Message" in data:
+                    print(f"⚠️ Alpha Vantage error: {data['Error Message']}")
                     logger.warning(f"Alpha Vantage error: {data['Error Message']}")
                     return None
                 
+                print(f"✅ Alpha Vantage response for {symbol}: {list(data.keys())}")
                 return data
+            else:
+                print(f"❌ Alpha Vantage HTTP error: {response.status_code}")
             
         except Exception as e:
-            logger.warning(f"Alpha Vantage API error: {e}")
+            print(f"❌ Alpha Vantage API error for {symbol}: {e}")
+            logger.warning(f"Alpha Vantage API error for {symbol}: {e}")
         
         return None
     
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """Get current prices with multiple fallbacks"""
+        """Get current prices with Alpha Vantage FIRST, then fallbacks"""
         
         now = time.time()
         prices = {}
+        
+        print(f"📊 Getting prices for {tickers}")
         
         # Check cache
         stale_tickers = []
@@ -157,24 +183,37 @@ class DataFetcher:
             stale_tickers.append(ticker)
         
         if not stale_tickers:
+            print("📦 All prices from cache")
             return prices
         
-        # Try Alpha Vantage first
+        print(f"📡 Fetching fresh prices for: {stale_tickers}")
+        
+        # ===== FORCE ALPHA VANTAGE FIRST =====
         if self.alpha_vantage_key:
+            print(f"🔑 Using Alpha Vantage API: {self.alpha_vantage_key[:8]}...")
             for ticker in stale_tickers:
+                print(f"📡 Calling Alpha Vantage for {ticker}...")
                 data = self._call_alpha_vantage(ticker, "GLOBAL_QUOTE")
+                
                 if data and "Global Quote" in data:
                     quote = data["Global Quote"]
                     price = quote.get("05. price")
                     if price and float(price) > 0:
-                        prices[ticker] = float(price)
-                        self.price_cache[ticker] = float(price)
+                        price_val = float(price)
+                        prices[ticker] = price_val
+                        self.price_cache[ticker] = price_val
                         self.cache_timestamp[ticker] = now
                         self.current_source = "Alpha Vantage"
-                        logger.info(f"✅ Alpha Vantage: {ticker} = ${price}")
+                        print(f"✅ Alpha Vantage: {ticker} = ${price_val}")
+                        logger.info(f"✅ Alpha Vantage: {ticker} = ${price_val}")
                         continue
+                    else:
+                        print(f"⚠️ Alpha Vantage: No valid price for {ticker}")
+                else:
+                    print(f"⚠️ Alpha Vantage: No data for {ticker}")
                 
-                # If Alpha Vantage fails, try Yahoo
+                # If Alpha Vantage fails, try Yahoo Finance
+                print(f"📡 Trying Yahoo Finance for {ticker}...")
                 try:
                     stock = yf.Ticker(ticker)
                     info = stock.info
@@ -184,9 +223,11 @@ class DataFetcher:
                         self.price_cache[ticker] = float(price)
                         self.cache_timestamp[ticker] = now
                         self.current_source = "Yahoo Finance"
+                        print(f"✅ Yahoo Finance: {ticker} = ${price}")
                         logger.info(f"✅ Yahoo Finance: {ticker} = ${price}")
                         continue
                 except Exception as e:
+                    print(f"⚠️ Yahoo failed for {ticker}: {e}")
                     logger.warning(f"Yahoo failed for {ticker}: {e}")
                 
                 # Ultimate fallback: default price
@@ -194,7 +235,27 @@ class DataFetcher:
                 self.price_cache[ticker] = prices[ticker]
                 self.cache_timestamp[ticker] = now
                 self.current_source = "Default (Fallback)"
-                logger.info(f"⚠️ Default price for {ticker}: ${prices[ticker]}")
+                print(f"⚠️ Default price for {ticker}: ${prices[ticker]}")
+        else:
+            # No Alpha Vantage key - use Yahoo + defaults
+            print("⚠️ No Alpha Vantage key - using Yahoo + defaults")
+            for ticker in stale_tickers:
+                try:
+                    stock = yf.Ticker(ticker)
+                    info = stock.info
+                    price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+                    if price and price > 0:
+                        prices[ticker] = float(price)
+                        self.price_cache[ticker] = float(price)
+                        self.cache_timestamp[ticker] = now
+                        self.current_source = "Yahoo Finance"
+                        continue
+                except:
+                    pass
+                prices[ticker] = self.default_prices.get(ticker, 100)
+                self.price_cache[ticker] = prices[ticker]
+                self.cache_timestamp[ticker] = now
+                self.current_source = "Default (Fallback)"
         
         return prices
     
@@ -351,7 +412,6 @@ class DataFetcher:
         """Start live price simulation"""
         if self.use_live_simulation:
             logger.info(f"🔄 Starting live simulation for {tickers}")
-            # Initialize with default prices
             self.live_prices = {}
             for ticker in tickers:
                 self.live_prices[ticker] = self.default_prices.get(ticker, 100)
@@ -370,7 +430,6 @@ class DataFetcher:
     def get_live_prices(self) -> Dict[str, float]:
         """Get current live prices"""
         if hasattr(self, 'live_prices') and self.is_running:
-            # Simulate small price changes
             for ticker in self.live_prices:
                 change = np.random.uniform(-0.005, 0.005) * self.live_prices[ticker]
                 self.live_prices[ticker] += change
@@ -380,7 +439,6 @@ class DataFetcher:
     
     def get_price_history(self, ticker: str) -> List[Dict]:
         """Get price history for a ticker"""
-        # Return a simple history for now
         if hasattr(self, 'live_prices') and ticker in self.live_prices:
             return [{
                 'time': datetime.now() - timedelta(minutes=i),
