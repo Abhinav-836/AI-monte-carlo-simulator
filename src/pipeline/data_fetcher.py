@@ -1,5 +1,6 @@
 """
-Professional Data Fetcher with Alpha Vantage + Yahoo Finance Fallback
+Professional Data Fetcher with Alpha Vantage Primary + Yahoo Finance Fallback
+FIXED for Streamlit Cloud deployment
 """
 
 import yfinance as yf
@@ -11,10 +12,6 @@ import requests
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
-from functools import lru_cache
-import threading
-import json
-from collections import deque
 import os
 from dotenv import load_dotenv
 
@@ -30,10 +27,18 @@ class AlphaVantageClient:
         self.api_key = api_key or os.environ.get("ALPHA_VANTAGE_API_KEY", "")
         self.base_url = "https://www.alphavantage.co/query"
         self.last_call = 0
-        self.min_interval = 12  # Alpha Vantage free tier: 5 calls per minute = 12 seconds between calls
+        self.min_interval = 12  # Free tier: 5 calls per minute
+        self.has_api_key = bool(self.api_key and self.api_key != "your_alpha_vantage_api_key_here")
+        
+        if self.has_api_key:
+            logger.info("✅ Alpha Vantage API key found")
+        else:
+            logger.warning("⚠️ No Alpha Vantage API key found - using fallback only")
         
     def _rate_limit(self):
         """Apply rate limiting for Alpha Vantage API"""
+        if not self.has_api_key:
+            return
         now = time.time()
         elapsed = now - self.last_call
         if elapsed < self.min_interval:
@@ -42,7 +47,7 @@ class AlphaVantageClient:
     
     def get_quote(self, symbol: str) -> Optional[Dict]:
         """Get real-time quote for a symbol"""
-        if not self.api_key:
+        if not self.has_api_key:
             return None
             
         try:
@@ -58,22 +63,26 @@ class AlphaVantageClient:
                 data = response.json()
                 if "Global Quote" in data and data["Global Quote"]:
                     quote = data["Global Quote"]
-                    return {
-                        "symbol": quote.get("01. symbol", symbol),
-                        "price": float(quote.get("05. price", 0)),
-                        "change": float(quote.get("09. change", 0)),
-                        "change_percent": float(quote.get("10. change percent", "0%").strip("%")),
-                        "volume": int(quote.get("06. volume", 0)),
-                        "timestamp": quote.get("07. latest trading day", datetime.now().strftime("%Y-%m-%d"))
-                    }
+                    price = quote.get("05. price")
+                    if price and float(price) > 0:
+                        return {
+                            "symbol": quote.get("01. symbol", symbol),
+                            "price": float(price),
+                            "change": float(quote.get("09. change", 0)),
+                            "change_percent": float(quote.get("10. change percent", "0%").strip("%")),
+                            "volume": int(quote.get("06. volume", 0)),
+                            "timestamp": quote.get("07. latest trading day", datetime.now().strftime("%Y-%m-%d"))
+                        }
+            else:
+                logger.warning(f"Alpha Vantage API returned status {response.status_code} for {symbol}")
         except Exception as e:
             logger.warning(f"Alpha Vantage quote error for {symbol}: {e}")
         
         return None
     
-    def get_historical(self, symbol: str, output_size: str = "full") -> Optional[pd.DataFrame]:
+    def get_historical(self, symbol: str, output_size: str = "compact") -> Optional[pd.DataFrame]:
         """Get historical data from Alpha Vantage"""
-        if not self.api_key:
+        if not self.has_api_key:
             return None
             
         try:
@@ -96,6 +105,10 @@ class AlphaVantageClient:
                     df.columns = ["Open", "High", "Low", "Close", "Volume"]
                     df = df.sort_index()
                     return df
+                elif "Note" in data:
+                    logger.warning(f"Alpha Vantage rate limit: {data['Note']}")
+                elif "Error Message" in data:
+                    logger.warning(f"Alpha Vantage error: {data['Error Message']}")
         except Exception as e:
             logger.warning(f"Alpha Vantage historical error for {symbol}: {e}")
         
@@ -103,20 +116,25 @@ class AlphaVantageClient:
     
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, float]:
         """Get quotes for multiple symbols"""
+        if not self.has_api_key:
+            return {}
+            
         prices = {}
         for symbol in symbols:
             quote = self.get_quote(symbol)
             if quote and quote.get("price", 0) > 0:
                 prices[symbol] = quote["price"]
+            # Add delay between symbols for rate limiting
+            time.sleep(1)
         return prices
 
 
 class YahooFinanceClient:
-    """Yahoo Finance Client as Fallback"""
+    """Yahoo Finance Client as Fallback - Reduced calls to avoid rate limiting"""
     
     def __init__(self):
         self.last_call = 0
-        self.min_interval = 1  # 1 second between calls
+        self.min_interval = 2  # Increased to 2 seconds to avoid rate limiting
     
     def _rate_limit(self):
         now = time.time()
@@ -130,6 +148,16 @@ class YahooFinanceClient:
         try:
             self._rate_limit()
             stock = yf.Ticker(symbol)
+            # Try fast_info first (faster, fewer API calls)
+            try:
+                fast_info = stock.fast_info
+                price = fast_info.get("last_price")
+                if price and price > 0:
+                    return float(price)
+            except:
+                pass
+            
+            # Fallback to regular info
             info = stock.info
             price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('ask') or info.get('previousClose')
             if price and price > 0:
@@ -142,7 +170,15 @@ class YahooFinanceClient:
         """Get historical data from Yahoo Finance"""
         try:
             self._rate_limit()
-            data = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=True)
+            data = yf.download(
+                symbol, 
+                period=period, 
+                interval="1d", 
+                progress=False, 
+                auto_adjust=True,
+                threads=False,
+                timeout=10
+            )
             if not data.empty:
                 return data
         except Exception as e:
@@ -150,12 +186,13 @@ class YahooFinanceClient:
         return None
     
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, float]:
-        """Get quotes for multiple symbols"""
+        """Get quotes for multiple symbols - rate limited"""
         prices = {}
         for symbol in symbols:
             price = self.get_quote(symbol)
             if price:
                 prices[symbol] = price
+            time.sleep(1)  # Delay between symbols
         return prices
 
 
@@ -170,18 +207,18 @@ class DataFetcher:
         self.yahoo_finance = YahooFinanceClient()
         
         # Track which source is being used
-        self.primary_source = "Alpha Vantage" if self.alpha_vantage.api_key else "Yahoo Finance"
+        self.primary_source = "Alpha Vantage" if self.alpha_vantage.has_api_key else "Yahoo Finance"
         self.current_source = self.primary_source
         self.fallback_used = False
         
         # Enhanced caching
         self.price_cache = {}
         self.cache_timestamp = {}
-        self.cache_duration = 30  # 30 seconds for live data
+        self.cache_duration = 60  # 60 seconds for live data
         
         self.historical_cache = {}
         self.historical_timestamp = {}
-        self.historical_cache_duration = 3600  # 1 hour
+        self.historical_cache_duration = 1800  # 30 minutes
         
         # Live simulation
         self.use_live_simulation = use_live_simulation
@@ -199,7 +236,6 @@ class DataFetcher:
     def _load_default_prices(self) -> Dict[str, float]:
         """Load default prices as ultimate fallback"""
         return {
-            # US Stocks
             'AAPL': 175.32, 'MSFT': 380.45, 'GOOGL': 142.18,
             'AMZN': 178.50, 'META': 472.30, 'TSLA': 198.75,
             'NVDA': 820.15, 'JPM': 152.80, 'V': 255.60,
@@ -210,18 +246,9 @@ class DataFetcher:
             'INTC': 42.50, 'CSCO': 52.75, 'PEP': 170.30,
             'COST': 700.25, 'CVX': 155.40, 'WFC': 55.20,
             'QCOM': 165.30, 'TMO': 550.15, 'ABT': 110.25,
-            
-            # Indian Stocks
             'RELIANCE.NS': 2500.00, 'TCS.NS': 3500.00, 'HDFCBANK.NS': 1600.00,
             'INFY.NS': 1450.00, 'ICICIBANK.NS': 1050.00, 'SBIN.NS': 600.00,
-            'BHARTIARTL.NS': 850.00, 'ITC.NS': 400.00, 'WIPRO.NS': 500.00,
-            'HINDUNILVR.NS': 2500.00, 'TITAN.NS': 2800.00, 'BAJFINANCE.NS': 7000.00,
-            'MARUTI.NS': 9500.00, 'SUNPHARMA.NS': 1200.00, 'ONGC.NS': 150.00,
-            
-            # Crypto
-            'BTC-USD': 65000, 'ETH-USD': 3500, 'BNB-USD': 450,
-            'XRP-USD': 0.75, 'ADA-USD': 0.45, 'DOGE-USD': 0.12,
-            'SOL-USD': 150.00, 'DOT-USD': 8.00, 'MATIC-USD': 0.80,
+            'BTC-USD': 65000, 'ETH-USD': 3500, 'SOL-USD': 150.00,
         }
 
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
@@ -242,12 +269,15 @@ class DataFetcher:
         if not stale_tickers:
             return prices
         
-        # Try Alpha Vantage first
-        self.current_source = "Alpha Vantage"
-        self.fallback_used = False
+        # Try Alpha Vantage first if available
+        av_prices = {}
+        if self.alpha_vantage.has_api_key:
+            self.current_source = "Alpha Vantage"
+            self.fallback_used = False
+            av_prices = self.alpha_vantage.get_batch_quotes(stale_tickers)
         
-        # Try batch fetch from Alpha Vantage
-        av_prices = self.alpha_vantage.get_batch_quotes(stale_tickers)
+        # Track which tickers need fallback
+        fallback_tickers = []
         
         for ticker in stale_tickers:
             if ticker in av_prices and av_prices[ticker] > 0:
@@ -255,11 +285,16 @@ class DataFetcher:
                 self.price_cache[ticker] = av_prices[ticker]
                 self.cache_timestamp[ticker] = now
             else:
-                # Try Yahoo Finance as fallback
-                yf_price = self.yahoo_finance.get_quote(ticker)
-                if yf_price and yf_price > 0:
-                    prices[ticker] = yf_price
-                    self.price_cache[ticker] = yf_price
+                fallback_tickers.append(ticker)
+        
+        # Try Yahoo Finance for remaining tickers
+        if fallback_tickers:
+            yf_prices = self.yahoo_finance.get_batch_quotes(fallback_tickers)
+            
+            for ticker in fallback_tickers:
+                if ticker in yf_prices and yf_prices[ticker] > 0:
+                    prices[ticker] = yf_prices[ticker]
+                    self.price_cache[ticker] = yf_prices[ticker]
                     self.cache_timestamp[ticker] = now
                     self.fallback_used = True
                     self.current_source = "Yahoo Finance (Fallback)"
@@ -268,10 +303,6 @@ class DataFetcher:
                     prices[ticker] = self.default_prices.get(ticker, 100)
                     self.price_cache[ticker] = prices[ticker]
                     self.cache_timestamp[ticker] = now
-        
-        # Update source tracking
-        if self.fallback_used:
-            self.current_source = "Yahoo Finance (Fallback)"
         
         return prices
 
@@ -294,35 +325,45 @@ class DataFetcher:
         self.fallback_used = False
         
         for ticker in tickers:
-            # Try Alpha Vantage first
-            av_data = self.alpha_vantage.get_historical(ticker, "full")
+            data = None
             
-            if av_data is not None and not av_data.empty:
-                # Alpha Vantage returns daily data, we need to filter by period
-                if period == "6mo":
-                    av_data = av_data.last(126)  # ~6 months
-                elif period == "1y":
-                    av_data = av_data.last(252)  # ~1 year
-                elif period == "2y":
-                    av_data = av_data.last(504)  # ~2 years
-                elif period == "5y":
-                    av_data = av_data.last(1260)  # ~5 years
-                
-                all_data.append(av_data[['Close']].rename(columns={'Close': ticker}))
-                logger.info(f"✅ Alpha Vantage: {ticker} ({len(av_data)} days)")
-            else:
-                # Fallback to Yahoo Finance
+            # Try Alpha Vantage first
+            if self.alpha_vantage.has_api_key:
+                av_data = self.alpha_vantage.get_historical(ticker, "compact")
+                if av_data is not None and not av_data.empty and len(av_data) > 30:
+                    # Filter by period
+                    if period == "6mo":
+                        av_data = av_data.last(126)
+                    elif period == "1y":
+                        av_data = av_data.last(252)
+                    elif period == "2y":
+                        av_data = av_data.last(504)
+                    elif period == "5y":
+                        av_data = av_data.last(1260)
+                    
+                    if not av_data.empty:
+                        data = av_data[['Close']].rename(columns={'Close': ticker})
+                        logger.info(f"✅ Alpha Vantage: {ticker} ({len(data)} days)")
+            
+            # Fallback to Yahoo if Alpha Vantage failed
+            if data is None:
                 yf_data = self.yahoo_finance.get_historical(ticker, period)
                 if yf_data is not None and not yf_data.empty:
                     if 'Close' in yf_data.columns:
-                        all_data.append(yf_data[['Close']].rename(columns={'Close': ticker}))
+                        data = yf_data[['Close']].rename(columns={'Close': ticker})
                         self.fallback_used = True
-                        logger.info(f"✅ Yahoo Fallback: {ticker} ({len(yf_data)} days)")
-                else:
-                    # Generate synthetic data as last resort
-                    logger.warning(f"⚠️ Generating synthetic data for {ticker}")
-                    synthetic = self._generate_synthetic_data([ticker], period)
-                    all_data.append(synthetic)
+                        logger.info(f"✅ Yahoo Fallback: {ticker} ({len(data)} days)")
+            
+            # Generate synthetic data as last resort
+            if data is None:
+                logger.warning(f"⚠️ Generating synthetic data for {ticker}")
+                data = self._generate_single_synthetic(ticker, period)
+            
+            if data is not None:
+                all_data.append(data)
+            
+            # Add delay between tickers
+            time.sleep(1)
         
         if not all_data:
             logger.warning(f"⚠️ No data available, using synthetic")
@@ -350,23 +391,27 @@ class DataFetcher:
             logger.error(f"❌ Data combination failed: {e}")
             return self._generate_synthetic_data(tickers, period)
 
+    def _generate_single_synthetic(self, ticker: str, period: str) -> pd.DataFrame:
+        """Generate synthetic data for a single ticker"""
+        days = self._period_to_days(period)
+        dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
+        base_price = self.default_prices.get(ticker, 100)
+        returns = np.random.randn(days) * 0.02 + 0.0003
+        prices = base_price * np.exp(np.cumsum(returns))
+        prices = np.maximum(prices, base_price * 0.3)
+        return pd.DataFrame({ticker: prices}, index=dates)
+
     def _generate_synthetic_data(self, tickers: List[str], period: str) -> pd.DataFrame:
         """Generate synthetic data as ultimate fallback"""
         logger.info(f"🔄 Generating synthetic data for {tickers}")
-        
-        days = self._period_to_days(period)
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
-        
-        data = {}
-        for ticker in tickers:
-            base_price = self.default_prices.get(ticker, 100)
-            returns = np.random.randn(days) * 0.02 + 0.0003
-            prices = base_price * np.exp(np.cumsum(returns))
-            prices = np.maximum(prices, base_price * 0.3)
-            data[ticker] = prices
-        
         self.current_source = "Synthetic (Fallback)"
-        return pd.DataFrame(data, index=dates)
+        
+        all_data = []
+        for ticker in tickers:
+            data = self._generate_single_synthetic(ticker, period)
+            all_data.append(data)
+        
+        return pd.concat(all_data, axis=1)
 
     def _period_to_days(self, period: str) -> int:
         """Convert period to days"""
@@ -379,13 +424,46 @@ class DataFetcher:
         return 252
 
     def get_option_chain(self, ticker: str) -> Dict:
-        """Get option chain (Yahoo Finance only - Alpha Vantage doesn't provide this)"""
-        return self.yahoo_finance.get_option_chain(ticker) if hasattr(self.yahoo_finance, 'get_option_chain') else {}
+        """Get option chain (Yahoo Finance only)"""
+        try:
+            stock = yf.Ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                return {}
+            
+            chain = stock.option_chain(expirations[0])
+            calls = []
+            for _, row in chain.calls.head(10).iterrows():
+                calls.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                    'impliedVolatility': float(row.get('impliedVolatility', 0))
+                })
+            
+            puts = []
+            for _, row in chain.puts.head(10).iterrows():
+                puts.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                    'impliedVolatility': float(row.get('impliedVolatility', 0))
+                })
+            
+            return {
+                'calls': calls,
+                'puts': puts,
+                'expiration': expirations[0],
+                'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
+            }
+        except Exception as e:
+            logger.warning(f"Option chain error for {ticker}: {e}")
+            return {}
 
     def get_data_source_info(self) -> str:
         """Get info about current data source"""
         return self.current_source
-
-    def get_market_summary(self) -> Dict:
-        """Get market summary with key indices (Yahoo Finance)"""
-        return self.yahoo_finance.get_market_summary() if hasattr(self.yahoo_finance, 'get_market_summary') else {}
