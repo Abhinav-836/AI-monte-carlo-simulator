@@ -18,6 +18,28 @@ import random
 from dotenv import load_dotenv
 import yfinance as yf
 
+# DEBUG: Check what secrets are available on Streamlit Cloud
+try:
+    import streamlit as st
+    print("=" * 50)
+    print("🔍 SECRETS DEBUG INFO")
+    print("=" * 50)
+    if hasattr(st, 'secrets'):
+        print(f"📋 Secrets type: {type(st.secrets)}")
+        print(f"📋 Secrets keys: {list(st.secrets.keys())}")
+        for key in st.secrets.keys():
+            value = st.secrets[key]
+            if 'API' in key or 'KEY' in key:
+                print(f"   {key}: {str(value)[:10]}... (length: {len(str(value))})")
+            else:
+                print(f"   {key}: {value}")
+    else:
+        print("❌ st.secrets not available")
+    print("=" * 50)
+except Exception as e:
+    print(f"❌ Error reading secrets: {e}")
+
+
 # Load environment variables
 load_dotenv(override=True)
 
