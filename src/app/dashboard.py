@@ -880,7 +880,8 @@ def run_dashboard():
                         boxpoints='outliers'
                     ), row=1, col=2)
                     
-                    from scipy import stats                    kde = stats.gaussian_kde(final_prices)
+                    from scipy import stats                    
+                    kde = stats.gaussian_kde(final_prices)
                     x_range = np.linspace(final_prices.min(), final_prices.max(), 100)
                     fig.add_trace(go.Scatter(
                         x=x_range, 
