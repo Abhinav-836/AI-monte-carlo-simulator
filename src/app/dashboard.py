@@ -43,6 +43,23 @@ except ImportError:
     LlamaExplainer = None
     print("⚠️ LlamaExplainer not available")
 
+# Debug: Check API key status
+def check_api_key():
+    try:
+        if hasattr(st, 'secrets'):
+            keys_found = list(st.secrets.keys())
+            print(f"📋 Secrets keys found: {keys_found}")
+            
+            if 'ALPHA_VANTAGE_API_KEY' in st.secrets:
+                key = st.secrets['ALPHA_VANTAGE_API_KEY']
+                print(f"✅ ALPHA_VANTAGE_API_KEY found: {key[:8]}...")
+            else:
+                print("❌ ALPHA_VANTAGE_API_KEY NOT in secrets")
+    except Exception as e:
+        print(f"❌ Error reading secrets: {e}")
+
+# Call this when app starts
+check_api_key()
 
 def run_dashboard():
     """Main function to run the dashboard"""
