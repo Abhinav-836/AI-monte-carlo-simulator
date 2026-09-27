@@ -16,6 +16,10 @@ import logging
 import os
 import streamlit as st
 
+# ✅ Load .env BEFORE reading any keys
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,38 +71,49 @@ class DataFetcher:
         print(f"   🔑 Finnhub: {'✅' if self.finnhub_client else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
 
+    # ============================================================
+    # ✅ KEY GETTERS — fall through to os.environ when st.secrets is empty
+    # ============================================================
     def _get_twelve_data_key(self) -> str:
+        # Try Streamlit secrets first (cloud)
         try:
             if hasattr(st, 'secrets'):
                 try:
-                    return st.secrets.get('TWELVE_DATA_API_KEY', '') or ''
+                    val = st.secrets.get('TWELVE_DATA_API_KEY', '')
+                    if val and str(val).strip():
+                        return str(val).strip()
                 except Exception:
                     pass
         except Exception:
             pass
-        return os.environ.get("TWELVE_DATA_API_KEY", "") or ""
+        # Fallback to env var (local .env)
+        return (os.environ.get("TWELVE_DATA_API_KEY", "") or "").strip()
 
     def _get_alpha_vantage_key(self) -> str:
         try:
             if hasattr(st, 'secrets'):
                 try:
-                    return st.secrets.get('ALPHA_VANTAGE_API_KEY', '') or ''
+                    val = st.secrets.get('ALPHA_VANTAGE_API_KEY', '')
+                    if val and str(val).strip():
+                        return str(val).strip()
                 except Exception:
                     pass
         except Exception:
             pass
-        return os.environ.get("ALPHA_VANTAGE_API_KEY", "") or ""
+        return (os.environ.get("ALPHA_VANTAGE_API_KEY", "") or "").strip()
 
     def _get_finnhub_key(self) -> str:
         try:
             if hasattr(st, 'secrets'):
                 try:
-                    return st.secrets.get('FINNHUB_API_KEY', '') or ''
+                    val = st.secrets.get('FINNHUB_API_KEY', '')
+                    if val and str(val).strip():
+                        return str(val).strip()
                 except Exception:
                     pass
         except Exception:
             pass
-        return os.environ.get("FINNHUB_API_KEY", "") or ""
+        return (os.environ.get("FINNHUB_API_KEY", "") or "").strip()
 
     # ============================================================
     # SYMBOL CONVERSION for Twelve Data
@@ -107,15 +122,6 @@ class DataFetcher:
         """
         Convert yfinance-style tickers to Twelve Data format.
         Twelve Data uses `EXCHANGE:SYMBOL` for non-US markets.
-
-        Examples:
-            AAPL        → AAPL           (US, default)
-            RELIANCE.NS → NSE:RELIANCE   (India)
-            TCS.NS      → NSE:TCS
-            BP.L        → LSE:BP         (UK)
-            HSBA.L      → LSE:HSBA
-            BTC-USD     → BTC/USD        (crypto)
-            ETH-USD     → ETH/USD
         """
         if ticker.endswith('.NS'):
             return f"NSE:{ticker[:-3]}"
