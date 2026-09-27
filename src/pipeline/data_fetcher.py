@@ -2,8 +2,8 @@
 Professional Data Fetcher - 4-tier fallback
 Finnhub → Alpha Vantage → yfinance (with curl_cffi) → Synthetic
 
-curl_cffi impersonates Chrome's TLS fingerprint, bypassing Yahoo's
-datacenter-IP blocking on Streamlit Cloud.
+Uses yfinance >= 0.2.54 with native curl_cffi support for Chrome
+impersonation (bypasses Yahoo's cloud-IP blocking on Streamlit Cloud).
 """
 
 import pandas as pd
@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 
 class DataFetcher:
     """
-    Data Fetcher with 4-tier fallback:
+    4-tier fallback:
         1. Finnhub        (fast, US-focused)
         2. Alpha Vantage  (global, 25/day limit)
-        3. yfinance       (global, uses curl_cffi impersonation to bypass cloud blocks)
+        3. yfinance       (global, uses curl_cffi impersonation natively)
         4. Synthetic      (last resort)
     """
 
@@ -35,13 +35,11 @@ class DataFetcher:
 
         self.current_source = "No Data"
 
-        # Live simulation support
         self.live_simulator = None
         self._price_subscribers = []
         self.is_running = False
         self.live_prices = {}
 
-        # Cache
         self.price_cache = {}
         self.cache_timestamp = {}
         self.cache_duration = 60
@@ -50,18 +48,24 @@ class DataFetcher:
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
 
-        # ✅ Detect curl_cffi availability at startup
-        self._has_curl_cffi = False
+        # ✅ Verify yfinance + curl_cffi availability
+        self._yf_ok = False
+        self._curl_cffi_ok = False
         try:
-            from curl_cffi import requests as _cr  # noqa: F401
-            self._has_curl_cffi = True
+            import yfinance as yf
+            self._yf_ok = True
+            try:
+                from curl_cffi import requests as _cr  # noqa: F401
+                self._curl_cffi_ok = True
+            except ImportError:
+                pass
         except ImportError:
             pass
 
         print("✅ DataFetcher initialized")
         print(f"   🔑 Finnhub: {'✅' if self.finnhub_key else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
-        print(f"   📊 yfinance: ✅ (curl_cffi impersonation: {'✅' if self._has_curl_cffi else '❌'})")
+        print(f"   📊 yfinance: {'✅' if self._yf_ok else '❌'} (curl_cffi: {'✅' if self._curl_cffi_ok else '❌'})")
 
     # ============================================================
     # SAFE SECRETS ACCESS
@@ -89,27 +93,35 @@ class DataFetcher:
         return os.environ.get("FINNHUB_API_KEY", "") or ""
 
     # ============================================================
-    # CURL_CFFI SESSION HELPER
+    # YFINANCE HELPER — uses new yfinance>=0.2.54 curl_cffi session API
     # ============================================================
+    def _make_yf_session(self):
+        """
+        Create a curl_cffi session for yfinance.
+
+        ✅ FIX: In yfinance >= 0.2.54, passing a curl_cffi session to
+        Ticker(session=...) works correctly. In older versions the API
+        was different → 'too many values to unpack'.
+        """
+        if not self._curl_cffi_ok:
+            return None
+        try:
+            from curl_cffi import requests as curl_requests
+            return curl_requests.Session(impersonate="chrome")
+        except Exception as e:
+            print(f"⚠️ Could not create curl_cffi session: {e}")
+            return None
+
     def _make_yf_ticker(self, symbol: str):
-        """
-        Create a yfinance Ticker with a curl_cffi impersonated session.
-
-        Streamlit Cloud datacenter IPs are blocked by Yahoo. curl_cffi
-        impersonates Chrome's TLS fingerprint, bypassing the block.
-        Falls back to plain yfinance if curl_cffi unavailable.
-        """
+        """Create a yfinance Ticker with curl_cffi session when available."""
         import yfinance as yf
-
-        if self._has_curl_cffi:
+        session = self._make_yf_session()
+        if session is not None:
             try:
-                from curl_cffi import requests as curl_requests
-                session = curl_requests.Session(impersonate="chrome")
                 return yf.Ticker(symbol, session=session)
-            except Exception as e:
-                print(f"⚠️ curl_cffi session failed for {symbol}: {e}")
-
-        # Fallback — plain yfinance (works locally, blocked on cloud)
+            except TypeError:
+                # Older yfinance doesn't accept session kwarg
+                pass
         return yf.Ticker(symbol)
 
     # ============================================================
@@ -128,6 +140,8 @@ class DataFetcher:
                 if price and price > 0:
                     print(f"✅ Finnhub: {symbol} = ${price}")
                     return float(price)
+                else:
+                    print(f"⚠️ Finnhub no data for {symbol}")
         except Exception as e:
             print(f"⚠️ Finnhub error for {symbol}: {e}")
         return None
@@ -154,40 +168,42 @@ class DataFetcher:
                         print(f"✅ Alpha Vantage: {symbol} = ${price}")
                         return float(price)
                 elif "Note" in data:
-                    print(f"⏳ Alpha Vantage rate limit: {symbol}")
+                    print(f"⏳ Alpha Vantage rate limit hit")
+                elif "Information" in data:
+                    print(f"⏳ Alpha Vantage: {data['Information'][:80]}")
         except Exception as e:
             print(f"⚠️ Alpha Vantage error for {symbol}: {e}")
         return None
 
     # ============================================================
-    # TIER 3: YFINANCE (with curl_cffi impersonation)
+    # TIER 3: YFINANCE (with curl_cffi)
     # ============================================================
     def _call_yfinance(self, symbol: str) -> Optional[float]:
-        """yfinance fallback with curl_cffi Chrome impersonation"""
+        """yfinance fallback with curl_cffi impersonation"""
         try:
             ticker = self._make_yf_ticker(symbol)
 
-            # Try fast_info first (fastest)
+            # Try fast_info
             try:
                 price = ticker.fast_info.get('last_price')
                 if price and price > 0:
-                    tag = "impersonated" if self._has_curl_cffi else "plain"
+                    tag = "impersonated" if self._curl_cffi_ok else "plain"
                     print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
                     return float(price)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ yfinance fast_info failed for {symbol}: {e}")
 
-            # Fallback: recent history
+            # Try history (period="5d")
             try:
                 hist = ticker.history(period="5d", auto_adjust=False)
                 if not hist.empty and 'Close' in hist.columns:
                     price = float(hist['Close'].iloc[-1])
                     if price > 0:
-                        tag = "impersonated" if self._has_curl_cffi else "plain"
+                        tag = "impersonated" if self._curl_cffi_ok else "plain"
                         print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
                         return price
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ yfinance history failed for {symbol}: {e}")
 
         except Exception as e:
             print(f"⚠️ yfinance error for {symbol}: {e}")
@@ -197,7 +213,7 @@ class DataFetcher:
     # CURRENT PRICES — 4-tier fallback
     # ============================================================
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """Get current prices: Finnhub → AV → yfinance → synthetic (never empty)"""
+        """Get current prices: Finnhub → AV → yfinance → synthetic"""
         now = time.time()
         prices = {}
         stale_tickers = []
@@ -260,10 +276,10 @@ class DataFetcher:
         return prices
 
     # ============================================================
-    # HISTORICAL DATA — AV → yfinance (curl_cffi) → synthetic
+    # HISTORICAL DATA
     # ============================================================
     def get_historical_data(self, tickers_tuple: Tuple[str, ...], period: str = "1y") -> Optional[pd.DataFrame]:
-        """Historical data: Alpha Vantage → yfinance (curl_cffi) → synthetic"""
+        """Historical data: AV → yfinance (curl_cffi) → synthetic"""
 
         cache_key = f"{tickers_tuple}_{period}"
         now = time.time()
@@ -282,8 +298,37 @@ class DataFetcher:
         for ticker in tickers:
             data = None
 
-            # ---- Tier 1: Alpha Vantage ----
-            if self.alpha_vantage_key:
+            # ---- Tier 1: yfinance (curl_cffi) — prefer this for full history ----
+            if data is None:
+                try:
+                    from datetime import datetime as _dt, timedelta as _td
+
+                    print(f"📡 Trying yfinance historical for {ticker}...")
+                    ticker_obj = self._make_yf_ticker(ticker)
+
+                    end_dt = _dt.now()
+                    start_dt = end_dt - _td(days=int(days * 1.6))
+
+                    hist = ticker_obj.history(
+                        start=start_dt.strftime("%Y-%m-%d"),
+                        end=end_dt.strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        interval="1d"
+                    )
+
+                    if not hist.empty and 'Close' in hist.columns:
+                        df = hist[['Close']].rename(columns={'Close': ticker})
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                        if len(df) > days:
+                            df = df.iloc[-days:]
+                        data = df
+                        tag = "impersonated" if self._curl_cffi_ok else "plain"
+                        print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
+                except Exception as e:
+                    print(f"⚠️ yfinance historical error for {ticker}: {e}")
+
+            # ---- Tier 2: Alpha Vantage ----
+            if data is None and self.alpha_vantage_key:
                 try:
                     url = "https://www.alphavantage.co/query"
                     params = {
@@ -307,39 +352,6 @@ class DataFetcher:
                                 print(f"✅ Alpha Vantage historical: {ticker} ({len(data)} days)")
                 except Exception as e:
                     print(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
-
-            # ---- Tier 2: yfinance with curl_cffi impersonation ----
-            if data is None:
-                try:
-                    from datetime import datetime as _dt, timedelta as _td
-
-                    print(f"📡 Trying yfinance historical for {ticker}...")
-
-                    ticker_obj = self._make_yf_ticker(ticker)
-
-                    # ✅ FIX: use explicit start/end dates.
-                    # Using period="2y" fails for crypto (BTC-USD) & UK (.L)
-                    # with "Invalid frequency: 504".
-                    end_dt = _dt.now()
-                    start_dt = end_dt - _td(days=int(days * 1.6))
-
-                    hist = ticker_obj.history(
-                        start=start_dt.strftime("%Y-%m-%d"),
-                        end=end_dt.strftime("%Y-%m-%d"),
-                        auto_adjust=False,
-                        interval="1d"
-                    )
-
-                    if not hist.empty and 'Close' in hist.columns:
-                        df = hist[['Close']].rename(columns={'Close': ticker})
-                        df.index = pd.to_datetime(df.index).tz_localize(None)
-                        if len(df) > days:
-                            df = df.iloc[-days:]
-                        data = df
-                        tag = "impersonated" if self._has_curl_cffi else "plain"
-                        print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
-                except Exception as e:
-                    print(f"⚠️ yfinance historical error for {ticker}: {e}")
 
             # ---- Tier 3: Synthetic ----
             if data is None:
@@ -383,9 +395,6 @@ class DataFetcher:
             print(f"❌ Data generation failed: {e}")
             return None
 
-    # ============================================================
-    # HELPERS
-    # ============================================================
     def _period_to_days(self, period: str) -> int:
         if period.endswith('d'):
             return int(period[:-1])
