@@ -1,8 +1,9 @@
 """
-Professional Data Fetcher - 4-tier fallback with Webshare proxy
-Finnhub → Alpha Vantage → yfinance (via Webshare proxy) → Synthetic
+Professional Data Fetcher — 5-tier fallback
+Twelve Data → Finnhub → Alpha Vantage → yfinance → Synthetic
 
-Uses yfinance's `proxy=` parameter explicitly (env vars are ignored by yfinance).
+Twelve Data free tier: 800 requests/day, covers US, India, UK, crypto.
+Works on Streamlit Cloud with NO proxy needed.
 """
 
 import pandas as pd
@@ -18,58 +19,18 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# WEBSHARE PROXY BOOTSTRAP
-# ============================================================
-def _get_proxy_config():
-    """Read Webshare proxy credentials from secrets or env vars."""
-    host = port = user = pw = None
-
-    try:
-        if hasattr(st, 'secrets'):
-            host = st.secrets.get('WEBSHARE_PROXY_HOST', '') or host
-            port = st.secrets.get('WEBSHARE_PROXY_PORT', '') or port
-            user = st.secrets.get('WEBSHARE_PROXY_USER', '') or user
-            pw = st.secrets.get('WEBSHARE_PROXY_PASS', '') or pw
-    except Exception:
-        pass
-
-    host = host or os.environ.get('WEBSHARE_PROXY_HOST', '')
-    port = port or os.environ.get('WEBSHARE_PROXY_PORT', '')
-    user = user or os.environ.get('WEBSHARE_PROXY_USER', '')
-    pw = pw or os.environ.get('WEBSHARE_PROXY_PASS', '')
-
-    if not (host and port and user and pw):
-        return None
-
-    proxy_url = f"http://{user}:{pw}@{host}:{port}"
-    return {"http": proxy_url, "https": proxy_url}
-
-
-_PROXY = _get_proxy_config()
-_PROXY_ENABLED = _PROXY is not None
-
-if _PROXY_ENABLED:
-    # Also set env vars for requests-based calls
-    os.environ['HTTP_PROXY'] = _PROXY["http"]
-    os.environ['HTTPS_PROXY'] = _PROXY["https"]
-    os.environ['http_proxy'] = _PROXY["http"]
-    os.environ['https_proxy'] = _PROXY["https"]
-    print(f"✅ Webshare proxy configured: {_PROXY['http'].split('@')[-1]}")
-else:
-    print("⚠️ Webshare proxy not configured")
-
-
 class DataFetcher:
     """
-    4-tier fallback:
-        1. Finnhub           (fast, US markets)
-        2. Alpha Vantage     (25/day, global)
-        3. yfinance (proxy)  (ALL markets — via Webshare)
-        4. Synthetic         (last resort)
+    5-tier fallback:
+        1. Twelve Data    (free, all markets, cloud-safe) ← PRIMARY
+        2. Finnhub        (US-focused)
+        3. Alpha Vantage  (25/day limit)
+        4. yfinance       (works locally, may fail on cloud)
+        5. Synthetic      (last resort)
     """
 
     def __init__(self, use_live_simulation: bool = False):
+        self.twelve_data_key = self._get_twelve_data_key()
         self.alpha_vantage_key = self._get_alpha_vantage_key()
         self.finnhub_key = self._get_finnhub_key()
         self.use_live_simulation = use_live_simulation
@@ -83,16 +44,11 @@ class DataFetcher:
 
         self.price_cache = {}
         self.cache_timestamp = {}
-        self.cache_duration = 60
+        self.cache_duration = 300  # 5 min — preserve Twelve Data quota
 
         self.historical_cache = {}
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
-
-        # Proxy
-        self.proxies = _get_proxy_config()
-        self._proxy_enabled = self.proxies is not None
-        self._proxy_url = self.proxies["https"] if self.proxies else None
 
         # Finnhub SDK
         self.finnhub_client = None
@@ -107,9 +63,20 @@ class DataFetcher:
                 print(f"   ⚠️ Finnhub SDK init failed: {e}")
 
         print("✅ DataFetcher initialized")
+        print(f"   🎯 Twelve Data: {'✅' if self.twelve_data_key else '❌'}")
         print(f"   🔑 Finnhub: {'✅' if self.finnhub_client else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
-        print(f"   🌐 Webshare proxy: {'✅ enabled' if self._proxy_enabled else '❌ disabled'}")
+
+    def _get_twelve_data_key(self) -> str:
+        try:
+            if hasattr(st, 'secrets'):
+                try:
+                    return st.secrets.get('TWELVE_DATA_API_KEY', '') or ''
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return os.environ.get("TWELVE_DATA_API_KEY", "") or ""
 
     def _get_alpha_vantage_key(self) -> str:
         try:
@@ -134,7 +101,76 @@ class DataFetcher:
         return os.environ.get("FINNHUB_API_KEY", "") or ""
 
     # ============================================================
-    # TIER 1: FINNHUB (US-only on free tier)
+    # SYMBOL CONVERSION for Twelve Data
+    # ============================================================
+    def _convert_to_twelve_symbol(self, ticker: str) -> str:
+        """
+        Convert yfinance-style tickers to Twelve Data format.
+        Twelve Data uses `EXCHANGE:SYMBOL` for non-US markets.
+
+        Examples:
+            AAPL        → AAPL           (US, default)
+            RELIANCE.NS → NSE:RELIANCE   (India)
+            TCS.NS      → NSE:TCS
+            BP.L        → LSE:BP         (UK)
+            HSBA.L      → LSE:HSBA
+            BTC-USD     → BTC/USD        (crypto)
+            ETH-USD     → ETH/USD
+        """
+        if ticker.endswith('.NS'):
+            return f"NSE:{ticker[:-3]}"
+        if ticker.endswith('.L'):
+            return f"LSE:{ticker[:-2]}"
+        if ticker.endswith('.HK'):
+            return f"HKEX:{ticker[:-3]}"
+        if ticker.endswith('.TO'):
+            return f"TSX:{ticker[:-3]}"
+        if ticker.endswith('.AX'):
+            return f"ASX:{ticker[:-3]}"
+        if ticker.endswith('.DE'):
+            return f"XETR:{ticker[:-3]}"
+        if '-USD' in ticker:
+            return ticker.replace('-', '/')
+        return ticker
+
+    # ============================================================
+    # TIER 1: TWELVE DATA (primary — all markets)
+    # ============================================================
+    def _call_twelve_data(self, symbol: str) -> Optional[float]:
+        """Twelve Data price endpoint — works on cloud, no proxy needed."""
+        if not self.twelve_data_key:
+            return None
+        try:
+            td_symbol = self._convert_to_twelve_symbol(symbol)
+            url = "https://api.twelvedata.com/price"
+            params = {
+                "symbol": td_symbol,
+                "apikey": self.twelve_data_key,
+            }
+            response = requests.get(url, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                if "price" in data:
+                    price = float(data["price"])
+                    if price > 0:
+                        print(f"✅ Twelve Data: {symbol} = ${price}")
+                        return price
+                elif "code" in data:
+                    code = data.get("code")
+                    if code == 429:
+                        print(f"⏳ Twelve Data rate limit hit")
+                    elif code == 401:
+                        print(f"⚠️ Twelve Data: invalid API key")
+                    else:
+                        msg = data.get("message", "")[:80]
+                        print(f"⚠️ Twelve Data: {msg}")
+        except Exception as e:
+            print(f"⚠️ Twelve Data error for {symbol}: {e}")
+        return None
+
+    # ============================================================
+    # TIER 2: FINNHUB (US-only on free tier)
     # ============================================================
     def _call_finnhub(self, symbol: str) -> Optional[float]:
         if not self.finnhub_client:
@@ -155,7 +191,7 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 2: ALPHA VANTAGE
+    # TIER 3: ALPHA VANTAGE
     # ============================================================
     def _call_alpha_vantage(self, symbol: str) -> Optional[float]:
         if not self.alpha_vantage_key:
@@ -167,10 +203,7 @@ class DataFetcher:
                 "symbol": symbol,
                 "apikey": self.alpha_vantage_key
             }
-            response = requests.get(
-                url, params=params, timeout=10,
-                proxies=self.proxies if self._proxy_enabled else None
-            )
+            response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if "Global Quote" in data and data["Global Quote"]:
@@ -185,78 +218,36 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 3: YFINANCE via Webshare proxy (explicit proxy param)
+    # TIER 4: YFINANCE
     # ============================================================
     def _call_yfinance(self, symbol: str) -> Optional[float]:
-        """yfinance — explicitly routed through Webshare proxy via yf.download(proxy=...)"""
         try:
             import yfinance as yf
+            ticker = yf.Ticker(symbol)
 
-            proxy_url = self._proxy_url
-
-            # ---------- Try yf.download with explicit proxy ----------
             try:
-                if proxy_url:
-                    hist = yf.download(
-                        symbol,
-                        period="5d",
-                        interval="1d",
-                        auto_adjust=False,
-                        progress=False,
-                        proxy=proxy_url,
-                        threads=False,
-                    )
-                else:
-                    hist = yf.download(
-                        symbol,
-                        period="5d",
-                        interval="1d",
-                        auto_adjust=False,
-                        progress=False,
-                        threads=False,
-                    )
+                price = ticker.fast_info.get('last_price')
+                if price and price > 0:
+                    print(f"✅ yfinance: {symbol} = ${price:.2f}")
+                    return float(price)
+            except Exception:
+                pass
 
-                if hist is not None and not hist.empty:
-                    # Handle multi-index columns
-                    if isinstance(hist.columns, pd.MultiIndex):
-                        if ('Close', symbol) in hist.columns:
-                            close_series = hist[('Close', symbol)]
-                        elif 'Close' in hist.columns.get_level_values(0):
-                            close_series = hist.xs('Close', axis=1, level=0).iloc[:, 0]
-                        else:
-                            close_series = hist.iloc[:, 0]
-                    else:
-                        close_series = hist['Close']
-
-                    close_series = close_series.dropna()
-                    if len(close_series) > 0:
-                        price = float(close_series.iloc[-1])
-                        if price > 0:
-                            tag = "via proxy" if proxy_url else "direct"
-                            print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
-                            return price
-            except Exception as e:
-                print(f"⚠️ yfinance download failed for {symbol}: {e}")
-
-            # ---------- Fallback: Ticker.history ----------
             try:
-                ticker = yf.Ticker(symbol)
                 hist = ticker.history(period="5d", auto_adjust=False)
                 if not hist.empty and 'Close' in hist.columns:
                     price = float(hist['Close'].dropna().iloc[-1])
                     if price > 0:
-                        tag = "via proxy" if proxy_url else "direct"
-                        print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
+                        print(f"✅ yfinance: {symbol} = ${price:.2f}")
                         return price
-            except Exception as e:
-                print(f"⚠️ yfinance ticker.history failed for {symbol}: {e}")
-
+            except Exception:
+                pass
         except Exception as e:
             print(f"⚠️ yfinance error for {symbol}: {e}")
         return None
 
     # ============================================================
-    # CURRENT PRICES — 4-tier fallback
+    # CURRENT PRICES — 5-tier fallback
     # ============================================================
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
         now = time.time()
@@ -280,22 +271,28 @@ class DataFetcher:
             price = None
             source = None
 
-            # Tier 1: Finnhub
-            price = self._call_finnhub(ticker)
+            # Tier 1: Twelve Data
+            price = self._call_twelve_data(ticker)
             if price:
-                source = "Finnhub"
+                source = "Twelve Data"
 
-            # Tier 2: Alpha Vantage
+            # Tier 2: Finnhub
+            if price is None:
+                price = self._call_finnhub(ticker)
+                if price:
+                    source = "Finnhub"
+
+            # Tier 3: Alpha Vantage
             if price is None:
                 price = self._call_alpha_vantage(ticker)
                 if price:
                     source = "Alpha Vantage"
 
-            # Tier 3: yfinance via proxy
+            # Tier 4: yfinance
             if price is None:
                 price = self._call_yfinance(ticker)
                 if price:
-                    source = "yfinance (proxy)"
+                    source = "yfinance"
 
             if price is not None and price > 0:
                 prices[ticker] = price
@@ -347,65 +344,70 @@ class DataFetcher:
         for ticker in tickers:
             data = None
 
-            # ---- Tier 1: yfinance via proxy ----
+            # ---- Tier 1: Twelve Data time_series ----
+            if data is None and self.twelve_data_key:
+                try:
+                    print(f"📡 Trying Twelve Data historical for {ticker}...")
+                    td_symbol = self._convert_to_twelve_symbol(ticker)
+                    url = "https://api.twelvedata.com/time_series"
+                    params = {
+                        "symbol": td_symbol,
+                        "interval": "1day",
+                        "outputsize": min(days, 5000),
+                        "apikey": self.twelve_data_key,
+                        "format": "JSON",
+                    }
+                    response = requests.get(url, params=params, timeout=15)
+
+                    if response.status_code == 200:
+                        result = response.json()
+                        if "values" in result:
+                            df = pd.DataFrame(result["values"])
+                            df["datetime"] = pd.to_datetime(df["datetime"])
+                            df = df.set_index("datetime").sort_index()
+                            df = df.astype(float)
+                            if len(df) > days:
+                                df = df.iloc[-days:]
+                            data = df[['close']].rename(columns={'close': ticker})
+                            print(f"✅ Twelve Data historical: {ticker} ({len(data)} days)")
+                        elif "code" in result:
+                            code = result.get("code")
+                            msg = result.get("message", "")[:80]
+                            if code == 429:
+                                print(f"⏳ Twelve Data rate limit hit")
+                            else:
+                                print(f"⚠️ Twelve Data historical: {msg}")
+                except Exception as e:
+                    print(f"⚠️ Twelve Data historical error for {ticker}: {e}")
+
+            # ---- Tier 2: yfinance ----
             if data is None:
                 try:
                     import yfinance as yf
                     from datetime import datetime as _dt, timedelta as _td
 
                     print(f"📡 Trying yfinance historical for {ticker}...")
-
-                    proxy_url = self._proxy_url
                     end_dt = _dt.now()
                     start_dt = end_dt - _td(days=int(days * 1.6))
 
-                    if proxy_url:
-                        hist = yf.download(
-                            ticker,
-                            start=start_dt.strftime("%Y-%m-%d"),
-                            end=end_dt.strftime("%Y-%m-%d"),
-                            interval="1d",
-                            auto_adjust=False,
-                            progress=False,
-                            proxy=proxy_url,
-                            threads=False,
-                        )
-                    else:
-                        hist = yf.download(
-                            ticker,
-                            start=start_dt.strftime("%Y-%m-%d"),
-                            end=end_dt.strftime("%Y-%m-%d"),
-                            interval="1d",
-                            auto_adjust=False,
-                            progress=False,
-                            threads=False,
-                        )
+                    hist = yf.Ticker(ticker).history(
+                        start=start_dt.strftime("%Y-%m-%d"),
+                        end=end_dt.strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        interval="1d"
+                    )
 
-                    if hist is not None and not hist.empty:
-                        # Handle multi-index
-                        if isinstance(hist.columns, pd.MultiIndex):
-                            if ('Close', ticker) in hist.columns:
-                                close_series = hist[('Close', ticker)]
-                            elif 'Close' in hist.columns.get_level_values(0):
-                                close_series = hist.xs('Close', axis=1, level=0).iloc[:, 0]
-                            else:
-                                close_series = hist.iloc[:, 0]
-                        else:
-                            close_series = hist['Close']
-
-                        close_series = close_series.dropna()
-                        if len(close_series) > 0:
-                            df = close_series.to_frame(name=ticker)
-                            df.index = pd.to_datetime(df.index).tz_localize(None)
-                            if len(df) > days:
-                                df = df.iloc[-days:]
-                            data = df
-                            tag = "via proxy" if proxy_url else "direct"
-                            print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
+                    if not hist.empty and 'Close' in hist.columns:
+                        df = hist[['Close']].rename(columns={'Close': ticker})
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                        if len(df) > days:
+                            df = df.iloc[-days:]
+                        data = df
+                        print(f"✅ yfinance historical: {ticker} ({len(data)} days)")
                 except Exception as e:
                     print(f"⚠️ yfinance historical error for {ticker}: {e}")
 
-            # ---- Tier 2: Alpha Vantage ----
+            # ---- Tier 3: Alpha Vantage ----
             if data is None and self.alpha_vantage_key:
                 try:
                     url = "https://www.alphavantage.co/query"
@@ -415,10 +417,7 @@ class DataFetcher:
                         "outputsize": "compact",
                         "apikey": self.alpha_vantage_key
                     }
-                    response = requests.get(
-                        url, params=params, timeout=10,
-                        proxies=self.proxies if self._proxy_enabled else None
-                    )
+                    response = requests.get(url, params=params, timeout=10)
                     if response.status_code == 200:
                         result = response.json()
                         if "Time Series (Daily)" in result:
@@ -434,11 +433,12 @@ class DataFetcher:
                 except Exception as e:
                     print(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
 
-            # ---- Tier 3: Synthetic ----
+            # ---- Tier 4: Synthetic ----
             if data is None:
                 print(f"⚠️ No historical data for {ticker}, using synthetic")
                 base_price = 100.0
                 current_price = (
+                    self._call_twelve_data(ticker) or
                     self._call_finnhub(ticker) or
                     self._call_alpha_vantage(ticker) or
                     self._call_yfinance(ticker)
@@ -486,47 +486,10 @@ class DataFetcher:
         return 252
 
     # ============================================================
-    # OPTION CHAIN
+    # OPTION CHAIN — unavailable without paid provider
     # ============================================================
     def get_option_chain(self, ticker: str) -> Dict:
-        try:
-            import yfinance as yf
-            stock = yf.Ticker(ticker)
-            expirations = stock.options
-            if not expirations:
-                return {}
-
-            chain = stock.option_chain(expirations[0])
-
-            calls = []
-            for _, row in chain.calls.head(10).iterrows():
-                calls.append({
-                    'strike': float(row.get('strike', 0)),
-                    'lastPrice': float(row.get('lastPrice', 0)),
-                    'bid': float(row.get('bid', 0)),
-                    'ask': float(row.get('ask', 0)),
-                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
-                })
-
-            puts = []
-            for _, row in chain.puts.head(10).iterrows():
-                puts.append({
-                    'strike': float(row.get('strike', 0)),
-                    'lastPrice': float(row.get('lastPrice', 0)),
-                    'bid': float(row.get('bid', 0)),
-                    'ask': float(row.get('ask', 0)),
-                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
-                })
-
-            return {
-                'calls': calls,
-                'puts': puts,
-                'expiration': expirations[0],
-                'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
-            }
-        except Exception as e:
-            print(f"⚠️ Option chain error for {ticker}: {e}")
-            return {}
+        return {}
 
     def get_data_source_info(self) -> str:
         return self.current_source
@@ -540,6 +503,7 @@ class DataFetcher:
             self.live_prices = {}
             for ticker in tickers:
                 price = (
+                    self._call_twelve_data(ticker) or
                     self._call_finnhub(ticker) or
                     self._call_alpha_vantage(ticker) or
                     self._call_yfinance(ticker)
