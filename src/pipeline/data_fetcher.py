@@ -1,9 +1,10 @@
 """
 Professional Data Fetcher — 5-tier fallback
-Twelve Data → Finnhub → Alpha Vantage → yfinance → Synthetic
+Twelve Data → Finnhub → Alpha Vantage → yfinance → Real-or-nothing
 
-Twelve Data free tier: 800 requests/day, covers US, India, UK, crypto.
+Twelve Data free tier: 800 requests/day, 8 requests/minute.
 Works on Streamlit Cloud with NO proxy needed.
+Never fabricates prices — real data or explicit "unavailable".
 """
 
 import pandas as pd
@@ -23,6 +24,12 @@ load_dotenv(override=True)
 logger = logging.getLogger(__name__)
 
 
+@st.cache_resource
+def get_data_fetcher(use_live_simulation: bool = False):
+    """Return one persistent DataFetcher per Streamlit app/session process."""
+    return DataFetcher(use_live_simulation=use_live_simulation)
+
+
 class DataFetcher:
     """
     5-tier fallback:
@@ -30,7 +37,7 @@ class DataFetcher:
         2. Finnhub        (US-focused)
         3. Alpha Vantage  (25/day limit)
         4. yfinance       (works locally, may fail on cloud)
-        5. Synthetic      (last resort)
+        5. Real-or-nothing (never synthetic)
     """
 
     def __init__(self, use_live_simulation: bool = False):
@@ -54,6 +61,9 @@ class DataFetcher:
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
 
+        # ✅ Rate-limit tracker for Twelve Data (8 req/min free tier)
+        self._td_last_call = 0.0
+
         # Finnhub SDK
         self.finnhub_client = None
         if self.finnhub_key:
@@ -75,7 +85,6 @@ class DataFetcher:
     # ✅ KEY GETTERS — fall through to os.environ when st.secrets is empty
     # ============================================================
     def _get_twelve_data_key(self) -> str:
-        # Try Streamlit secrets first (cloud)
         try:
             if hasattr(st, 'secrets'):
                 try:
@@ -86,7 +95,6 @@ class DataFetcher:
                     pass
         except Exception:
             pass
-        # Fallback to env var (local .env)
         return (os.environ.get("TWELVE_DATA_API_KEY", "") or "").strip()
 
     def _get_alpha_vantage_key(self) -> str:
@@ -116,6 +124,18 @@ class DataFetcher:
         return (os.environ.get("FINNHUB_API_KEY", "") or "").strip()
 
     # ============================================================
+    # ✅ RATE-LIMIT THROTTLE
+    # Twelve Data free tier = 8 requests/minute.
+    # Minimum 1 second between calls keeps us safely under the limit.
+    # ============================================================
+    def _throttle_twelve_data(self):
+        now = time.time()
+        elapsed = now - self._td_last_call
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+        self._td_last_call = time.time()
+
+    # ============================================================
     # SYMBOL CONVERSION for Twelve Data
     # ============================================================
     def _convert_to_twelve_symbol(self, ticker: str) -> str:
@@ -143,9 +163,12 @@ class DataFetcher:
     # TIER 1: TWELVE DATA (primary — all markets)
     # ============================================================
     def _call_twelve_data(self, symbol: str) -> Optional[float]:
-        """Twelve Data price endpoint — works on cloud, no proxy needed."""
+        """Twelve Data price endpoint — with rate-limit throttle."""
         if not self.twelve_data_key:
             return None
+
+        self._throttle_twelve_data()
+
         try:
             td_symbol = self._convert_to_twelve_symbol(symbol)
             url = "https://api.twelvedata.com/price"
@@ -165,7 +188,7 @@ class DataFetcher:
                 elif "code" in data:
                     code = data.get("code")
                     if code == 429:
-                        print(f"⏳ Twelve Data rate limit hit")
+                        print(f"⏳ Twelve Data rate limit hit for {symbol}")
                     elif code == 401:
                         print(f"⚠️ Twelve Data: invalid API key")
                     else:
@@ -176,7 +199,7 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 2: FINNHUB (US-only on free tier)
+    # TIER 2: FINNHUB
     # ============================================================
     def _call_finnhub(self, symbol: str) -> Optional[float]:
         if not self.finnhub_client:
@@ -190,7 +213,9 @@ class DataFetcher:
                     return float(price)
         except Exception as e:
             err_str = str(e)
-            if "403" in err_str:
+            if "401" in err_str:
+                print(f"⚠️ Finnhub: invalid API key (401)")
+            elif "403" in err_str:
                 print(f"⏭️ Finnhub: {symbol} not covered by free tier")
             else:
                 print(f"⚠️ Finnhub error for {symbol}: {e}")
@@ -224,7 +249,7 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 4: YFINANCE
+    # TIER 4: YFINANCE (used only for historical, not current)
     # ============================================================
     def _call_yfinance(self, symbol: str) -> Optional[float]:
         try:
@@ -253,7 +278,7 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # CURRENT PRICES — 5-tier fallback
+    # CURRENT PRICES — 4-tier fallback (no synthetic)
     # ============================================================
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
         now = time.time()
@@ -294,11 +319,10 @@ class DataFetcher:
                 if price:
                     source = "Alpha Vantage"
 
-            # Tier 4: yfinance
-            if price is None:
-                price = self._call_yfinance(ticker)
-                if price:
-                    source = "yfinance"
+            # Tier 4: last-known real price (never synthetic)
+            if price is None and ticker in self.price_cache:
+                price = self.price_cache[ticker]
+                source = "Cached"
 
             if price is not None and price > 0:
                 prices[ticker] = price
@@ -311,21 +335,9 @@ class DataFetcher:
             time.sleep(0.2)
 
         if missing:
-            print(f"⚠️ All APIs failed for: {missing} — using synthetic fallback")
-            for ticker in missing:
-                fb = 100.0
-                for key, df in self.historical_cache.items():
-                    if ticker in df.columns and len(df) > 0:
-                        try:
-                            fb = float(df[ticker].iloc[-1])
-                        except Exception:
-                            pass
-                        break
-
-                prices[ticker] = fb
-                self.price_cache[ticker] = fb
-                self.cache_timestamp[ticker] = now
-            self.current_source = "Synthetic Fallback"
+            print(f"⚠️ No live market data available for: {missing}")
+            # Never fabricate prices. A missing price stays missing.
+            self.current_source = "No Data" if not prices else "Partial Data"
 
         return prices
 
@@ -353,6 +365,8 @@ class DataFetcher:
             # ---- Tier 1: Twelve Data time_series ----
             if data is None and self.twelve_data_key:
                 try:
+                    self._throttle_twelve_data()
+
                     print(f"📡 Trying Twelve Data historical for {ticker}...")
                     td_symbol = self._convert_to_twelve_symbol(ticker)
                     url = "https://api.twelvedata.com/time_series"
@@ -439,25 +453,9 @@ class DataFetcher:
                 except Exception as e:
                     print(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
 
-            # ---- Tier 4: Synthetic ----
+            # ---- Tier 4: No synthetic. Real data or nothing. ----
             if data is None:
-                print(f"⚠️ No historical data for {ticker}, using synthetic")
-                base_price = 100.0
-                current_price = (
-                    self._call_twelve_data(ticker) or
-                    self._call_finnhub(ticker) or
-                    self._call_alpha_vantage(ticker) or
-                    self._call_yfinance(ticker)
-                )
-                if current_price:
-                    base_price = current_price
-
-                returns = np.random.randn(days) * 0.02 + 0.0003
-                prices = base_price * np.exp(np.cumsum(returns))
-                prices = np.maximum(prices, base_price * 0.3)
-                dates = pd.date_range(end=pd.Timestamp.now(), periods=days)
-                data = pd.DataFrame({ticker: prices}, index=dates)
-                print(f"📊 Generated synthetic data for {ticker} (base: ${base_price:.2f})")
+                print(f"❌ No real historical data available for {ticker}")
 
             if data is not None:
                 all_data.append(data)
@@ -514,7 +512,10 @@ class DataFetcher:
                     self._call_alpha_vantage(ticker) or
                     self._call_yfinance(ticker)
                 )
-                self.live_prices[ticker] = price if price else 100
+                if price is not None and price > 0:
+                    self.live_prices[ticker] = price
+                else:
+                    print(f"⚠️ No real live price available for {ticker}; skipping")
             self.is_running = True
             self.current_source = "Live Simulation"
 
@@ -541,3 +542,21 @@ class DataFetcher:
                 'price': self.live_prices[ticker] * (1 + np.random.uniform(-0.01, 0.01))
             } for i in range(20)]
         return []
+
+
+# ============================================================
+# Streamlit-level historical-data cache
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cached_historical_data(
+    tickers_tuple: Tuple[str, ...],
+    period: str = "1y",
+) -> Optional[pd.DataFrame]:
+    """
+    Streamlit-level historical-data cache.
+
+    Uses the persistent DataFetcher so repeated Streamlit reruns do not
+    repeatedly hit Twelve Data/yfinance/Alpha Vantage.
+    """
+    fetcher = get_data_fetcher()
+    return fetcher.get_historical_data(tickers_tuple, period)

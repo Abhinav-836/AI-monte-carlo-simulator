@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
-
 # Add root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
@@ -138,8 +137,8 @@ def run_dashboard():
                 pass
 
     def format_currency(value):
-        if value is None or np.isnan(value):
-            return "$0.00"
+        if value is None or value == 0 or (isinstance(value, float) and np.isnan(value)):
+            return "—"
         if value >= 1e9:
             return f"${value/1e9:.2f}B"
         elif value >= 1e6:
@@ -149,6 +148,7 @@ def run_dashboard():
         return f"${value:.2f}"
 
     def fetch_live_prices_from_pipeline(tickers):
+        """Fetch prices via pipeline DataFetcher. Real prices only — never synthetic."""
         prices = {}
         try:
             if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
@@ -156,7 +156,8 @@ def run_dashboard():
                 fetched = fetcher.get_current_prices(tickers, force_refresh=True)
                 if fetched:
                     for ticker in tickers:
-                        prices[ticker] = fetched.get(ticker, 100.0)
+                        if ticker in fetched and fetched[ticker] > 0:
+                            prices[ticker] = fetched[ticker]
                     return prices
         except Exception as e:
             print(f"⚠️ Error fetching from pipeline: {e}")
@@ -293,10 +294,14 @@ def run_dashboard():
         with st.spinner("Fetching live prices..."):
             try:
                 fresh = fetch_live_prices_from_pipeline(stocks)
+                # ✅ Merge with any existing cached prices — never overwrite real with missing
                 if fresh:
-                    st.session_state.live_prices = fresh
-                else:
-                    st.session_state.live_prices = {t: 100.0 for t in stocks}
+                    merged = dict(st.session_state.live_prices) if st.session_state.live_prices else {}
+                    merged.update(fresh)
+                    st.session_state.live_prices = merged
+                elif not st.session_state.live_prices:
+                    # Truly nothing available — leave dict empty so UI shows "—"
+                    st.session_state.live_prices = {}
 
                 st.session_state.prices_fetched = True
                 st.session_state.prices_fetched_for = list(stocks)
@@ -320,7 +325,7 @@ def run_dashboard():
         cols = st.columns(min(len(stocks), 8))
         for i, ticker in enumerate(stocks[:8]):
             with cols[i]:
-                price = st.session_state.live_prices.get(ticker, 0)
+                price = st.session_state.live_prices.get(ticker)
                 history = st.session_state.price_history.get(ticker, [])
                 change = 0
                 if len(history) >= 2:
@@ -328,14 +333,18 @@ def run_dashboard():
 
                 color = "#10b981" if change >= 0 else "#ef4444"
                 arrow = "↑" if change >= 0 else "↓"
+                price_display = format_currency(price) if price else "—"
 
                 st.markdown(f"""
                 <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 0.8rem; text-align: center; border: 1px solid rgba(255,255,255,0.1);">
                     <div style="font-size: 0.8rem; color: #94a3b8;">{ticker}</div>
-                    <div style="font-size: 1.3rem; font-weight: 600;">{format_currency(price)}</div>
+                    <div style="font-size: 1.3rem; font-weight: 600;">{price_display}</div>
                     <div style="font-size: 0.9rem; color: {color};">{arrow} {change:+.2f}%</div>
                 </div>
                 """, unsafe_allow_html=True)
+    elif stocks:
+        st.markdown("### 📊 Live Market Prices")
+        st.info("⏳ Live prices unavailable — check API keys or refresh")
 
     # ===================== RUN SIMULATION =====================
     if run_button and st.session_state.pipeline and stocks:
@@ -420,16 +429,11 @@ def run_dashboard():
         risk_metrics = results.get("risk_metrics", {})
         option_prices = results.get("option_prices", {})
 
-        # ============ ✅ FIX: Variance metric display ============
-        # Show "—" when variance is 0 or unrealistically high (>60%)
-        # instead of misleading values like 99.8%
         variance_reduction = results.get('variance_reduction', 0)
-
         if variance_reduction <= 0 or variance_reduction > 0.60:
             variance_display = "—"
         else:
             variance_display = f"{variance_reduction*100:.1f}%"
-        # =========================================================
 
         st.markdown("### 📊 Live Stats")
         cols = st.columns(8)
@@ -437,7 +441,7 @@ def run_dashboard():
             ("Paths", f"{metadata.get('n_simulations', 0):,}", "🔄"),
             ("Filtered", f"{metadata.get('filtered_paths', 0):,}", "🎯"),
             ("Time", f"{metadata.get('computation_time', 0):.1f}s", "⏱️"),
-            ("Variance", variance_display, "📉"),  # ✅ FIXED
+            ("Variance", variance_display, "📉"),
             ("Assets", f"{len(stocks)}", "📊"),
             ("Data", "Live", "📡"),
             ("AI Mode", "✅" if metadata.get('use_gan', False) else "⚡", "🤖"),
@@ -583,7 +587,6 @@ def run_dashboard():
                 else:
                     st.info("Add at least 2 assets")
 
-        # AI
         st.markdown('<div class="section-header">🧠 AI Market Analysis</div>', unsafe_allow_html=True)
         col_ai1, col_ai2 = st.columns([1, 3])
         with col_ai1:
