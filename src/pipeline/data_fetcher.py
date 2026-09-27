@@ -21,7 +21,7 @@ class DataFetcher:
     Data Fetcher with 4-tier fallback:
         1. Finnhub        (fast, primary)
         2. Alpha Vantage  (secondary)
-        3. yfinance       (broad coverage, no key needed)  ← NEW
+        3. yfinance       (broad coverage, no key needed)
         4. Synthetic      (last resort)
     """
 
@@ -125,14 +125,13 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 3: YFINANCE  ← NEW
+    # TIER 3: YFINANCE
     # ============================================================
     def _call_yfinance(self, symbol: str) -> Optional[float]:
         """yfinance fallback — works for global + crypto, no API key needed"""
         try:
             import yfinance as yf
 
-            # fast_info is faster than .info and less likely to be empty
             ticker = yf.Ticker(symbol)
             try:
                 price = ticker.fast_info.get('last_price')
@@ -142,7 +141,6 @@ class DataFetcher:
             except Exception:
                 pass
 
-            # Fallback: use recent history (last 5 days) and take last close
             try:
                 hist = ticker.history(period="5d", auto_adjust=False)
                 if not hist.empty and 'Close' in hist.columns:
@@ -183,21 +181,17 @@ class DataFetcher:
             price = None
             source = None
 
-            # Tier 1
             price = self._call_finnhub(ticker)
             if price: source = "Finnhub"
 
-            # Tier 2
             if price is None:
                 price = self._call_alpha_vantage(ticker)
                 if price: source = "Alpha Vantage"
 
-            # Tier 3
             if price is None:
                 price = self._call_yfinance(ticker)
                 if price: source = "yfinance"
 
-            # Store or mark missing
             if price is not None and price > 0:
                 prices[ticker] = price
                 self.price_cache[ticker] = price
@@ -208,12 +202,10 @@ class DataFetcher:
 
             time.sleep(0.2)
 
-        # Tier 4: synthetic fallback (never return empty)
         if missing:
             print(f"⚠️ All APIs failed for: {missing} — using synthetic fallback")
             for ticker in missing:
                 fb = 100.0
-                # Try historical cache first
                 for key, df in self.historical_cache.items():
                     if ticker in df.columns and len(df) > 0:
                         try:
@@ -230,7 +222,7 @@ class DataFetcher:
         return prices
 
     # ============================================================
-    # HISTORICAL DATA — AV → yfinance → synthetic
+    # HISTORICAL DATA — AV → yfinance (FIXED) → synthetic
     # ============================================================
     def get_historical_data(self, tickers_tuple: Tuple[str, ...], period: str = "1y") -> Optional[pd.DataFrame]:
         """Historical data: Alpha Vantage → yfinance → synthetic"""
@@ -278,19 +270,32 @@ class DataFetcher:
                 except Exception as e:
                     print(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
 
-            # ---- Tier 2: yfinance (NEW) ----
+            # ---- Tier 2: yfinance (FIXED: start/end dates, not period string) ----
             if data is None:
                 try:
                     import yfinance as yf
+                    from datetime import datetime as _dt, timedelta as _td
+
                     print(f"📡 Trying yfinance historical for {ticker}...")
-                    yf_period = self._days_to_yf_period(days)
-                    hist = yf.Ticker(ticker).history(period=yf_period, auto_adjust=False)
+
+                    # ✅ FIX: use explicit start/end dates.
+                    # Using period="2y" fails for crypto (BTC-USD) & UK (.L)
+                    # with "Invalid frequency: 504".
+                    end_dt = _dt.now()
+                    start_dt = end_dt - _td(days=int(days * 1.6))
+
+                    hist = yf.Ticker(ticker).history(
+                        start=start_dt.strftime("%Y-%m-%d"),
+                        end=end_dt.strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        interval="1d"
+                    )
 
                     if not hist.empty and 'Close' in hist.columns:
                         df = hist[['Close']].rename(columns={'Close': ticker})
                         df.index = pd.to_datetime(df.index).tz_localize(None)
                         if len(df) > days:
-                            df = df.last(days)
+                            df = df.iloc[-days:]
                         data = df
                         print(f"✅ yfinance historical: {ticker} ({len(data)} days)")
                 except Exception as e:
@@ -300,7 +305,6 @@ class DataFetcher:
             if data is None:
                 print(f"⚠️ No historical data for {ticker}, using synthetic")
                 base_price = 100.0
-                # Try to get a real base price first
                 current_price = (
                     self._call_finnhub(ticker) or
                     self._call_alpha_vantage(ticker) or
@@ -351,22 +355,10 @@ class DataFetcher:
             return int(period[:-1]) * 252
         return 252
 
-    def _days_to_yf_period(self, days: int) -> str:
-        """Convert day count → yfinance period string"""
-        if days <= 5:    return "5d"
-        if days <= 30:   return "1mo"
-        if days <= 90:   return "3mo"
-        if days <= 180:  return "6mo"
-        if days <= 365:  return "1y"
-        if days <= 730:  return "2y"
-        if days <= 1825: return "5y"
-        return "10y"
-
     # ============================================================
-    # OPTION CHAIN — yfinance (with graceful failure)
+    # OPTION CHAIN
     # ============================================================
     def get_option_chain(self, ticker: str) -> Dict:
-        """Option chain via yfinance (already the only source)"""
         try:
             import yfinance as yf
             stock = yf.Ticker(ticker)
