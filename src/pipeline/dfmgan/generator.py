@@ -20,7 +20,7 @@ class DFMGANConfig:
     hidden_dim: int = 64
     n_simulations: int = 1000
     filter_top_k: float = 0.1
-    batch_size_paths: int = 16   # increased slightly
+    batch_size_paths: int = 16
 
 
 # =========================
@@ -44,8 +44,12 @@ class ConditionalMCGenerator(nn.Module):
             batch_first=True
         )
 
-        self.register_buffer('hist_mean', torch.zeros(1))
-        self.register_buffer('hist_std', torch.ones(1))
+        # ✅ FIX: plain attributes (not registered buffers).
+        #         Buffers get moved by .to(device) and can conflict with
+        #         dynamic reassignment — using plain attrs avoids the
+        #         silent device mismatch that crashed on Streamlit.
+        self.hist_mean = None
+        self.hist_std = None
 
     def _build_adaptive_layers(self, n_assets, device):
         """Build layers dynamically"""
@@ -53,9 +57,6 @@ class ConditionalMCGenerator(nn.Module):
 
         self.input_proj = nn.Linear(n_assets, self.config.latent_dim).to(device)
         self.output_proj = nn.Linear(self.config.hidden_dim, n_assets).to(device)
-
-        self.hist_mean = torch.zeros(n_assets, device=device)
-        self.hist_std = torch.ones(n_assets, device=device)
 
     def forward(self, historical_data: torch.Tensor, n_paths: Optional[int] = None) -> torch.Tensor:
         """Generate realistic Monte Carlo paths"""
@@ -68,14 +69,14 @@ class ConditionalMCGenerator(nn.Module):
         B, T, A = historical_data.shape
         device = historical_data.device
 
-        # Build layers dynamically
+        # Build layers dynamically only when asset count changes
         if self.actual_n_assets != A:
             self._build_adaptive_layers(A, device)
 
-        # Compute statistics safely
+        # Compute statistics as local tensors (avoids buffer leak)
         with torch.no_grad():
-            self.hist_mean = historical_data.mean(dim=(0, 1))
-            self.hist_std = historical_data.std(dim=(0, 1)).clamp(min=1e-6)
+            hist_mean = historical_data.mean(dim=(0, 1))
+            hist_std = historical_data.std(dim=(0, 1)).clamp(min=1e-6)
 
         # Fix sequence length
         target_T = self.config.seq_len
@@ -88,7 +89,7 @@ class ConditionalMCGenerator(nn.Module):
             historical_data = torch.cat([historical_data, last_val], dim=1)
 
         # Normalize
-        hist_norm = (historical_data - self.hist_mean) / self.hist_std
+        hist_norm = (historical_data - hist_mean) / hist_std
 
         # Project
         hist_latent = self.input_proj(hist_norm)
@@ -106,19 +107,14 @@ class ConditionalMCGenerator(nn.Module):
                 device=device
             ) * 0.05
 
-            # Repeat base sequence for batch
             base = hist_latent[:1].repeat(current_batch, 1, 1)
-
             noisy_input = base + noise
 
             lstm_out, _ = self.lstm(noisy_input)
-
             path_norm = self.output_proj(lstm_out)
 
             # Denormalize
-            path = path_norm * self.hist_std + self.hist_mean
-
-            # Ensure positivity (financial prices)
+            path = path_norm * hist_std + hist_mean
             path = torch.clamp(path, min=1e-3)
 
             all_paths.append(path)
@@ -139,12 +135,10 @@ class TimeGANDiscriminator(nn.Module):
 
         self.conv = None
         self.fc = None
-
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def _build_adaptive_layers(self, n_assets, device):
         self.actual_n_assets = n_assets
-
         self.conv = nn.Conv1d(n_assets, 16, kernel_size=3, padding=1).to(device)
         self.fc = nn.Linear(16, 1).to(device)
 

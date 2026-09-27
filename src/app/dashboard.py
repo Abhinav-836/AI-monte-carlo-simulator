@@ -15,6 +15,7 @@ import os
 import time
 import json
 import random
+import threading
 from dotenv import load_dotenv
 import yfinance as yf
 
@@ -45,8 +46,7 @@ except ImportError:
 
 def run_dashboard():
     """Main function to run the dashboard"""
-    
-    # Page config
+
     st.set_page_config(
         page_title="AI Monte Carlo Simulator Pro",
         page_icon="📈",
@@ -82,13 +82,13 @@ def run_dashboard():
     st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
-        
+
         * { font-family: 'Space Grotesk', sans-serif; }
-        
+
         .stApp {
             background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
         }
-        
+
         .main-header {
             background: linear-gradient(135deg, #6366f1, #8b5cf6);
             padding: 2rem;
@@ -98,12 +98,12 @@ def run_dashboard():
             box-shadow: 0 20px 40px rgba(99, 102, 241, 0.3);
             animation: fadeIn 0.8s ease-in;
         }
-        
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(-20px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        
+
         .glass-panel {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -112,12 +112,12 @@ def run_dashboard():
             padding: 1.5rem;
             transition: all 0.3s ease;
         }
-        
+
         .glass-panel:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 30px rgba(99, 102, 241, 0.2);
         }
-        
+
         .metric-card {
             background: linear-gradient(135deg, #6366f1, #8b5cf6);
             border-radius: 16px;
@@ -127,22 +127,22 @@ def run_dashboard():
             box-shadow: 0 10px 30px rgba(99, 102, 241, 0.3);
             transition: transform 0.3s ease;
         }
-        
+
         .metric-card:hover {
             transform: scale(1.03);
         }
-        
+
         .metric-value {
             font-size: 2rem;
             font-weight: 700;
             margin: 0.5rem 0;
         }
-        
+
         .metric-label {
             font-size: 0.9rem;
             opacity: 0.9;
         }
-        
+
         .section-header {
             background: linear-gradient(90deg, #6366f1 0%, transparent 100%);
             padding: 1rem 2rem;
@@ -152,7 +152,7 @@ def run_dashboard():
             font-weight: 600;
             font-size: 1.3rem;
         }
-        
+
         .live-badge {
             display: inline-block;
             background: #ef4444;
@@ -162,12 +162,12 @@ def run_dashboard():
             font-size: 0.8rem;
             animation: pulse 1.5s ease-in-out infinite;
         }
-        
+
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        
+
         .info-box {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
@@ -176,21 +176,21 @@ def run_dashboard():
             border-radius: 16px;
             color: white;
         }
-        
+
         ::-webkit-scrollbar {
             width: 8px;
             height: 8px;
         }
-        
+
         ::-webkit-scrollbar-track {
             background: rgba(255, 255, 255, 0.05);
         }
-        
+
         ::-webkit-scrollbar-thumb {
             background: #6366f1;
             border-radius: 4px;
         }
-        
+
         .stButton > button {
             background: linear-gradient(135deg, #6366f1, #8b5cf6);
             color: white;
@@ -200,28 +200,28 @@ def run_dashboard():
             font-weight: 600;
             transition: all 0.3s ease;
         }
-        
+
         .stButton > button:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 30px rgba(99, 102, 241, 0.4);
         }
-        
+
         .stSelectbox > div, .stSlider > div {
             background: rgba(255, 255, 255, 0.05);
             border-radius: 8px;
         }
-        
+
         .stTextArea > div > textarea {
             background: rgba(255, 255, 255, 0.05);
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 8px;
             color: white;
         }
-        
+
         .stCheckbox > label {
             color: #94a3b8;
         }
-        
+
         .stDataFrame {
             background: rgba(255, 255, 255, 0.05);
             border-radius: 12px;
@@ -236,7 +236,7 @@ def run_dashboard():
         except AttributeError:
             try:
                 st.experimental_rerun()
-            except:
+            except Exception:
                 pass
 
     def format_currency(value):
@@ -266,13 +266,12 @@ def run_dashboard():
         return prices
 
     def fetch_live_prices(tickers):
-        """Fetch real-time prices with caching"""
+        """Fetch real-time prices with fallback to yfinance"""
         prices = {}
-        
+
         if st.session_state.pipeline and hasattr(st.session_state.pipeline, 'data_fetcher'):
             return fetch_live_prices_from_pipeline(tickers)
-        
-        # Fallback to Yahoo Finance
+
         try:
             for ticker in tickers:
                 try:
@@ -283,12 +282,12 @@ def run_dashboard():
                         prices[ticker] = float(price)
                     else:
                         prices[ticker] = 100 + random.uniform(-10, 10)
-                except:
+                except Exception:
                     prices[ticker] = 100 + random.uniform(-10, 10)
-        except:
+        except Exception:
             for ticker in tickers:
                 prices[ticker] = 100 + random.uniform(-10, 10)
-        
+
         return prices
 
     def simulate_live_update(tickers):
@@ -320,8 +319,7 @@ def run_dashboard():
     # ===================== SIDEBAR =====================
     with st.sidebar:
         st.markdown("### ⚙️ Controls")
-        
-        # Quick stock selection
+
         st.markdown("**Quick Select**")
         quick_cols = st.columns(2)
         with quick_cols[0]:
@@ -330,7 +328,7 @@ def run_dashboard():
         with quick_cols[1]:
             if st.button("🇮🇳 NSE", use_container_width=True):
                 st.session_state.stocks_input = "RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
-        
+
         quick_cols2 = st.columns(2)
         with quick_cols2[0]:
             if st.button("🇬🇧 UK", use_container_width=True):
@@ -338,27 +336,25 @@ def run_dashboard():
         with quick_cols2[1]:
             if st.button("₿ Crypto", use_container_width=True):
                 st.session_state.stocks_input = "BTC-USD, ETH-USD, BNB-USD, SOL-USD"
-        
-        # Stock input
+
         stocks_input = st.text_area(
             "**Enter Symbols**",
             value=st.session_state.stocks_input,
             height=80,
             help="Format: AAPL, MSFT.NS, 0700.HK, BTC-USD"
         )
-        
+
         if "," in stocks_input:
             stocks = [s.strip().upper() for s in stocks_input.split(",") if s.strip()]
         else:
             stocks = [s.strip().upper() for s in stocks_input.split("\n") if s.strip()]
-        
+
         st.session_state.stocks_input = ", ".join(stocks)
-        
+
         st.markdown("---")
-        
-        # Simulation Settings
+
         st.markdown("**Simulation**")
-        
+
         n_sims = st.slider(
             "Number of Paths",
             min_value=100,
@@ -366,47 +362,46 @@ def run_dashboard():
             value=1000,
             step=100
         )
-        
+
         use_gan = st.checkbox(
             "🤖 AI Generator",
             value=False,
             help="Use Deep Learning for realistic paths (requires training)"
         )
-        
+
         filter_pct = st.slider(
             "Keep Top %",
             min_value=1,
             max_value=50,
             value=10
         ) / 100
-        
+
         st.markdown("**Data**")
-        
+
         period = st.selectbox(
             "Time Period",
             options=["6mo", "1y", "2y", "5y"],
             index=2
         )
-        
+
         include_options = st.checkbox(
             "📋 Show Options",
             value=True
         )
-        
-        # Run button
+
         run_button = st.button(
             "🚀 RUN SIMULATION",
             use_container_width=True,
             type="primary"
         )
-        
+
         if st.button("🔄 Refresh Data", use_container_width=True):
             st.session_state.last_refresh = datetime.now()
             st.cache_data.clear()
             st.session_state.live_prices = {}
             st.session_state.prices_fetched = False
             safe_rerun()
-        
+
         st.caption(f"Tracking: {len(stocks)} assets")
 
     # ===================== INITIALIZE PIPELINE =====================
@@ -426,8 +421,7 @@ def run_dashboard():
                 st.session_state.pipeline = pipeline
                 st.session_state.error_message = None
                 print("✅ AI Engine Ready!")
-                
-                # After pipeline is initialized, fetch live prices immediately
+
                 if pipeline.data_fetcher:
                     print("📡 Fetching live prices...")
                     live_prices = fetch_live_prices_from_pipeline(stocks)
@@ -435,7 +429,7 @@ def run_dashboard():
                         st.session_state.live_prices = live_prices
                         st.session_state.prices_fetched = True
                         print(f"✅ Live prices loaded: {live_prices}")
-                
+
                 st.success("✅ AI Engine Ready!")
                 time.sleep(0.5)
                 safe_rerun()
@@ -463,8 +457,7 @@ def run_dashboard():
                         st.session_state.live_prices = simulate_live_update(stocks)
                     else:
                         st.session_state.live_prices = fetch_live_prices(stocks)
-                
-                # Store history
+
                 for ticker in stocks:
                     if ticker not in st.session_state.price_history:
                         st.session_state.price_history[ticker] = []
@@ -482,7 +475,7 @@ def run_dashboard():
     # ===================== LIVE PRICE DISPLAY =====================
     if st.session_state.live_prices:
         st.markdown("### 📊 Live Market Prices")
-        
+
         cols = st.columns(min(len(stocks), 8))
         for i, ticker in enumerate(stocks[:8]):
             with cols[i]:
@@ -491,10 +484,10 @@ def run_dashboard():
                 change = 0
                 if len(history) >= 2:
                     change = ((history[-1]['price'] - history[-2]['price']) / history[-2]['price']) * 100
-                
+
                 color = "#10b981" if change >= 0 else "#ef4444"
                 arrow = "↑" if change >= 0 else "↓"
-                
+
                 st.markdown(f"""
                 <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 0.8rem; text-align: center; border: 1px solid rgba(255,255,255,0.1);">
                     <div style="font-size: 0.8rem; color: #94a3b8;">{ticker}</div>
@@ -509,67 +502,72 @@ def run_dashboard():
         print("🚀 Starting simulation...")
         print(f"📊 Assets: {stocks}")
         print(f"📈 Paths: {n_sims}, Period: {period}")
-        
+
         with st.spinner("AI simulating market scenarios..."):
             try:
                 pipeline = st.session_state.pipeline
                 pipeline.n_simulations = n_sims
                 pipeline.filter_top_k = filter_pct
                 pipeline.use_gan = use_gan
-                
-                # Show progress with detailed steps
+
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
-                # Define progress steps with detailed messages
-                progress_steps = [
-                    (5, "📊 Fetching historical data..."),
-                    (10, "📊 Analyzing market patterns..."),
-                    (20, "📈 Calculating covariance matrices..."),
-                    (30, "🔄 Generating price paths..."),
-                    (40, "🔄 Running Monte Carlo simulations..."),
-                    (50, "🎯 Filtering most realistic paths..."),
-                    (60, "📊 Computing expected prices..."),
-                    (70, "📉 Calculating risk metrics (VaR, CVaR)..."),
-                    (80, "📊 Computing Sharpe and Sortino ratios..."),
-                    (90, "📊 Analyzing portfolio statistics..."),
-                    (95, "📊 Generating final results..."),
-                    (100, "✅ Simulation Complete!")
-                ]
-                
-                # Run simulation in background - print progress to Streamlit Cloud logs
+
+                # ✅ FIX: real-time progress via thread — no more fake 0.6s animation
+                progress_state = {"pct": 0, "msg": "Starting..."}
+
+                def _cb(pct, msg):
+                    progress_state["pct"] = pct
+                    progress_state["msg"] = msg
+
+                result_holder = {}
+
+                def _run():
+                    try:
+                        result_holder["results"] = pipeline.run_simulation(
+                            tickers=stocks,
+                            period=period,
+                            use_real_options=include_options,
+                            progress_callback=_cb
+                        )
+                    except Exception as ex:
+                        result_holder["error"] = ex
+
                 print("📊 Fetching historical data...")
-                results = pipeline.run_simulation(
-                    tickers=stocks,
-                    period=period,
-                    use_real_options=include_options
-                )
-                
-                # Update progress with detailed messages
-                for progress, message in progress_steps:
-                    progress_bar.progress(progress / 100)
-                    status_text.text(message)
-                    print(f"🔄 {message}")  # This goes to Streamlit Cloud logs
-                    time.sleep(0.05)
-                
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+
+                while t.is_alive():
+                    progress_bar.progress(min(progress_state["pct"], 99) / 100)
+                    status_text.text(progress_state["msg"])
+                    time.sleep(0.15)
+
+                t.join()
+                progress_bar.progress(1.0)
+                status_text.text("✅ Complete!")
+                time.sleep(0.3)
                 progress_bar.empty()
                 status_text.empty()
-                
+
+                if "error" in result_holder:
+                    raise result_holder["error"]
+
+                results = result_holder["results"]
+
                 st.session_state.results = results
                 st.session_state.explanation = None
                 st.session_state.error_message = None
                 st.session_state.simulation_running = False
-                
+
                 print("✅ Simulation Complete!")
-                
-                # Log results summary to Streamlit Cloud logs
+
                 metadata = results.get("metadata", {})
                 print(f"📊 Generated {metadata.get('n_simulations', 0)} paths")
                 print(f"🎯 Filtered to {metadata.get('filtered_paths', 0)} paths")
                 print(f"⏱️ Computation time: {metadata.get('computation_time', 0):.2f}s")
-                
+
                 st.success("✅ Simulation Complete!")
-                
+
             except Exception as e:
                 st.session_state.error_message = str(e)
                 print(f"❌ Simulation failed: {e}")
@@ -585,8 +583,7 @@ def run_dashboard():
         confidence_intervals = results.get("confidence_intervals", {})
         risk_metrics = results.get("risk_metrics", {})
         option_prices = results.get("option_prices", {})
-        
-        # Calculate actual variance reduction
+
         variance_reduction = results.get('variance_reduction', 0)
         if variance_reduction == 0 and 'path_sample' in results:
             paths = np.array(results['path_sample'])
@@ -596,10 +593,9 @@ def run_dashboard():
                 var_bench = var_sim * 1.5
                 variance_reduction = max(0, (var_bench - var_sim) / (var_bench + 1e-8))
                 variance_reduction = min(0.95, variance_reduction)
-        
-        # Metrics Row
+
         st.markdown("### 📊 Live Stats")
-        
+
         cols = st.columns(8)
         metrics_data = [
             ("Paths", f"{metadata.get('n_simulations', 0):,}", "🔄"),
@@ -611,7 +607,7 @@ def run_dashboard():
             ("AI Mode", "✅" if metadata.get('use_gan', False) else "⚡", "🤖"),
             ("Status", "🟢 Active", "✅")
         ]
-        
+
         for col, (label, value, emoji) in zip(cols, metrics_data):
             with col:
                 st.markdown(f"""
@@ -621,10 +617,10 @@ def run_dashboard():
                     <div class="metric-label">{label}</div>
                 </div>
                 """, unsafe_allow_html=True)
-        
+
         # Price Forecast Table
         st.markdown('<div class="section-header">💰 Price Forecast & Trends</div>', unsafe_allow_html=True)
-        
+
         price_data = []
         for stock in stocks:
             if stock in expected_prices:
@@ -633,7 +629,7 @@ def run_dashboard():
                 change = ((expected - current) / current * 100) if current else 0
                 ci = confidence_intervals.get(stock, [0, 0])
                 risk = risk_metrics.get(stock, {})
-                
+
                 if change > 10:
                     trend = "🚀 Strong Bullish"
                 elif change > 3:
@@ -644,7 +640,7 @@ def run_dashboard():
                     trend = "📉 Bearish"
                 else:
                     trend = "💥 Strong Bearish"
-                
+
                 sharpe = risk.get('sharpe', 0)
                 if sharpe > 1.5:
                     sharpe_indicator = "🌟 Excellent"
@@ -654,7 +650,7 @@ def run_dashboard():
                     sharpe_indicator = "⚠️ Average"
                 else:
                     sharpe_indicator = "❌ Poor"
-                
+
                 price_data.append({
                     "Asset": stock,
                     "Current": format_currency(current),
@@ -664,19 +660,19 @@ def run_dashboard():
                     "Sharpe": f"{sharpe:.2f} {sharpe_indicator}",
                     "Range": format_currency(ci[1] - ci[0])
                 })
-        
+
         if price_data:
             df_prices = pd.DataFrame(price_data)
             st.dataframe(df_prices, use_container_width=True, hide_index=True)
-        
+
         # ===================== ENHANCED GRAPHS =====================
         st.markdown('<div class="section-header">📈 Advanced Analytics</div>', unsafe_allow_html=True)
-        
+
         if "path_sample" in results and results["path_sample"]:
             paths = np.array(results["path_sample"])
-            
+
             tabs = st.tabs(["📊 Price Paths", "📉 Distribution", "📋 Options", "🔮 Risk Analysis", "📊 Portfolio"])
-            
+
             with tabs[0]:
                 col1, col2 = st.columns([2, 1])
                 with col1:
@@ -688,11 +684,11 @@ def run_dashboard():
                 with col2:
                     show_confidence = st.checkbox("Confidence Bands", value=True)
                     show_individual = st.checkbox("Individual Paths", value=False)
-                
+
                 if selected:
                     fig = go.Figure()
                     colors = ['#6366f1', '#8b5cf6', '#ec4899', '#10b981', '#f59e0b', '#3b82f6', '#ef4444']
-                    
+
                     for i, stock in enumerate(selected):
                         if stock in stocks:
                             idx = stocks.index(stock)
@@ -700,33 +696,33 @@ def run_dashboard():
                             upper = np.percentile(paths[:, :, idx], 95, axis=0)
                             lower = np.percentile(paths[:, :, idx], 5, axis=0)
                             color = colors[i % len(colors)]
-                            
+
                             if show_confidence:
                                 fig.add_trace(go.Scatter(
-                                    x=list(range(len(mean_path))), 
+                                    x=list(range(len(mean_path))),
                                     y=upper,
-                                    line=dict(width=0), 
-                                    showlegend=False, 
+                                    line=dict(width=0),
+                                    showlegend=False,
                                     hoverinfo='skip'
                                 ))
                                 fig.add_trace(go.Scatter(
-                                    x=list(range(len(mean_path))), 
+                                    x=list(range(len(mean_path))),
                                     y=lower,
-                                    fill='tonexty', 
+                                    fill='tonexty',
                                     fillcolor=f'rgba{tuple(int(color.lstrip("#")[j:j+2], 16) for j in (0,2,4)) + (0.15,)}',
-                                    line=dict(width=0), 
-                                    showlegend=False, 
+                                    line=dict(width=0),
+                                    showlegend=False,
                                     hoverinfo='skip'
                                 ))
-                            
+
                             fig.add_trace(go.Scatter(
-                                x=list(range(len(mean_path))), 
+                                x=list(range(len(mean_path))),
                                 y=mean_path,
-                                name=f'{stock} (Mean)', 
+                                name=f'{stock} (Mean)',
                                 line=dict(color=color, width=3),
                                 mode='lines'
                             ))
-                            
+
                             if show_individual and len(paths) > 0:
                                 for j in range(min(5, len(paths))):
                                     fig.add_trace(go.Scatter(
@@ -737,12 +733,12 @@ def run_dashboard():
                                         opacity=0.15,
                                         hoverinfo='skip'
                                     ))
-                    
+
                     fig.update_layout(
                         title="Price Paths with 95% Confidence Bands",
-                        xaxis_title="Trading Days", 
+                        xaxis_title="Trading Days",
                         yaxis_title="Price ($)",
-                        hovermode='x unified', 
+                        hovermode='x unified',
                         height=550,
                         template='plotly_dark',
                         legend=dict(
@@ -764,85 +760,87 @@ def run_dashboard():
                         )
                     )
                     st.plotly_chart(fig, use_container_width=True)
-            
+
             with tabs[1]:
                 stock = st.selectbox("Select asset for distribution analysis", options=stocks[:paths.shape[2]])
                 if stock:
                     idx = stocks.index(stock)
                     final_prices = paths[:, -1, idx]
-                    
+
                     fig = make_subplots(
                         rows=2, cols=2,
                         subplot_titles=("📊 Price Distribution", "📦 Box Plot", "📈 Density", "🎯 QQ Plot"),
                         specs=[[{"secondary_y": False}, {"secondary_y": False}],
                                [{"secondary_y": False}, {"secondary_y": False}]]
                     )
-                    
+
                     fig.add_trace(go.Histogram(
-                        x=final_prices, 
-                        nbinsx=50, 
+                        x=final_prices,
+                        nbinsx=50,
                         marker_color='#6366f1',
                         name='Distribution',
                         opacity=0.7
                     ), row=1, col=1)
-                    
+
                     fig.add_trace(go.Box(
-                        y=final_prices, 
-                        name=stock, 
+                        y=final_prices,
+                        name=stock,
                         marker_color='#8b5cf6',
                         boxmean='sd',
                         boxpoints='outliers'
                     ), row=1, col=2)
-                    
-                    from scipy import stats
-                    kde = stats.gaussian_kde(final_prices)
-                    x_range = np.linspace(final_prices.min(), final_prices.max(), 100)
-                    fig.add_trace(go.Scatter(
-                        x=x_range, 
-                        y=kde(x_range), 
-                        mode='lines', 
-                        name='Density',
-                        line=dict(color='#ec4899', width=2),
-                        fill='tozeroy',
-                        fillcolor='rgba(236, 72, 153, 0.1)'
-                    ), row=2, col=1)
-                    
-                    sorted_prices = np.sort(final_prices)
-                    theoretical = stats.norm.ppf(np.linspace(0.01, 0.99, len(sorted_prices)))
-                    fig.add_trace(go.Scatter(
-                        x=theoretical, 
-                        y=sorted_prices, 
-                        mode='markers', 
-                        name='QQ Plot',
-                        marker=dict(color='#10b981', size=4, opacity=0.6)
-                    ), row=2, col=2)
-                    
-                    min_val = min(theoretical.min(), sorted_prices.min())
-                    max_val = max(theoretical.max(), sorted_prices.max())
-                    fig.add_trace(go.Scatter(
-                        x=[min_val, max_val],
-                        y=[min_val, max_val],
-                        mode='lines',
-                        name='Reference',
-                        line=dict(color='#f59e0b', width=1, dash='dash'),
-                        showlegend=False
-                    ), row=2, col=2)
-                    
+
+                    try:
+                        from scipy import stats
+                        kde = stats.gaussian_kde(final_prices)
+                        x_range = np.linspace(final_prices.min(), final_prices.max(), 100)
+                        fig.add_trace(go.Scatter(
+                            x=x_range,
+                            y=kde(x_range),
+                            mode='lines',
+                            name='Density',
+                            line=dict(color='#ec4899', width=2),
+                            fill='tozeroy',
+                            fillcolor='rgba(236, 72, 153, 0.1)'
+                        ), row=2, col=1)
+
+                        sorted_prices = np.sort(final_prices)
+                        theoretical = stats.norm.ppf(np.linspace(0.01, 0.99, len(sorted_prices)))
+                        fig.add_trace(go.Scatter(
+                            x=theoretical,
+                            y=sorted_prices,
+                            mode='markers',
+                            name='QQ Plot',
+                            marker=dict(color='#10b981', size=4, opacity=0.6)
+                        ), row=2, col=2)
+
+                        min_val = min(theoretical.min(), sorted_prices.min())
+                        max_val = max(theoretical.max(), sorted_prices.max())
+                        fig.add_trace(go.Scatter(
+                            x=[min_val, max_val],
+                            y=[min_val, max_val],
+                            mode='lines',
+                            name='Reference',
+                            line=dict(color='#f59e0b', width=1, dash='dash'),
+                            showlegend=False
+                        ), row=2, col=2)
+                    except Exception as e:
+                        print(f"⚠️ KDE/QQ plot failed: {e}")
+
                     fig.update_layout(
-                        height=600, 
-                        template='plotly_dark', 
+                        height=600,
+                        template='plotly_dark',
                         showlegend=False,
                         paper_bgcolor='rgba(0,0,0,0)',
                         plot_bgcolor='rgba(0,0,0,0)'
                     )
                     st.plotly_chart(fig, use_container_width=True)
-            
+
             with tabs[2]:
                 if include_options and option_prices:
                     for stock, opt_data in option_prices.items():
                         if opt_data and opt_data.get('calls'):
                             with st.expander(f"📋 {stock} Options Chain"):
-                                # Check if it's a nested structure (multiple expirations)
                                 if isinstance(opt_data, dict) and any(k in opt_data for k in ['calls', 'puts', 'expiration']):
                                     col1, col2 = st.columns(2)
                                     with col1:
@@ -858,7 +856,6 @@ def run_dashboard():
                                     if opt_data.get('expiration'):
                                         st.caption(f"Expiration: {opt_data['expiration']}")
                                 else:
-                                    # Handle nested expiration format
                                     for exp_date, exp_data in opt_data.items():
                                         if isinstance(exp_data, dict) and 'calls' in exp_data:
                                             with st.expander(f"Expiration: {exp_date}"):
@@ -876,10 +873,10 @@ def run_dashboard():
                 else:
                     st.info("No options data available for selected assets")
                     st.info("💡 Try US stocks like AAPL, MSFT, GOOGL for options data")
-            
+
             with tabs[3]:
                 st.markdown("### 📊 Risk Metrics Dashboard")
-                
+
                 risk_data = []
                 for stock in stocks[:paths.shape[2]]:
                     risk = risk_metrics.get(stock, {})
@@ -893,11 +890,11 @@ def run_dashboard():
                             "Expected Return": f"{risk.get('expected_return', 0)*100:.1f}%",
                             "Max Drawdown": f"{risk.get('max_drawdown', 0)*100:.1f}%"
                         })
-                
+
                 if risk_data:
                     df_risk = pd.DataFrame(risk_data)
                     st.dataframe(df_risk, use_container_width=True, hide_index=True)
-                
+
                 st.markdown("#### Risk-Return Heatmap")
                 if risk_data:
                     df_heat = pd.DataFrame(risk_data)
@@ -905,7 +902,7 @@ def run_dashboard():
                     df_heat['Risk'] = df_heat['Volatility'].str.rstrip('%').astype(float)
                     df_heat['Sharpe'] = df_heat['Sharpe'].astype(float)
                     df_heat['Size'] = df_heat['Sharpe'].abs() * 10 + 5
-                    
+
                     fig = px.scatter(
                         df_heat,
                         x="Risk",
@@ -928,16 +925,16 @@ def run_dashboard():
                         yaxis=dict(gridcolor='rgba(255,255,255,0.05)')
                     )
                     st.plotly_chart(fig, use_container_width=True)
-            
+
             with tabs[4]:
                 st.markdown("### 📊 Portfolio Analysis")
-                
+
                 if len(stocks) >= 2:
                     n_portfolios = 1000
                     returns_list = []
                     volatilities = []
                     sharpe_ratios = []
-                    
+
                     asset_returns = []
                     asset_vols = []
                     for stock in stocks[:paths.shape[2]]:
@@ -945,28 +942,28 @@ def run_dashboard():
                         if risk:
                             asset_returns.append(risk.get('expected_return', 0.1))
                             asset_vols.append(risk.get('volatility', 0.2))
-                    
+
                     if len(asset_returns) >= 2:
                         asset_returns = np.array(asset_returns)
                         asset_vols = np.array(asset_vols)
-                        
+
                         corr_matrix = np.eye(len(asset_returns)) * 0.7 + 0.3
                         cov_matrix = np.outer(asset_vols, asset_vols) * corr_matrix
-                        
+
                         for _ in range(n_portfolios):
                             weights = np.random.random(len(asset_returns))
                             weights /= np.sum(weights)
-                            
+
                             ret = np.sum(weights * asset_returns)
                             vol = np.sqrt(weights.T @ cov_matrix @ weights)
                             sharpe = ret / vol if vol > 0 else 0
-                            
+
                             returns_list.append(ret)
                             volatilities.append(vol)
                             sharpe_ratios.append(sharpe)
-                        
+
                         fig = go.Figure()
-                        
+
                         fig.add_trace(go.Scatter(
                             x=volatilities,
                             y=returns_list,
@@ -980,7 +977,7 @@ def run_dashboard():
                             ),
                             name='Portfolios'
                         ))
-                        
+
                         best_idx = np.argmax(sharpe_ratios)
                         fig.add_trace(go.Scatter(
                             x=[volatilities[best_idx]],
@@ -989,7 +986,7 @@ def run_dashboard():
                             marker=dict(size=20, color='gold', symbol='star'),
                             name='🌟 Optimal Portfolio'
                         ))
-                        
+
                         fig.update_layout(
                             title="Efficient Frontier",
                             xaxis_title="Volatility (Risk)",
@@ -1002,7 +999,7 @@ def run_dashboard():
                             yaxis=dict(gridcolor='rgba(255,255,255,0.05)')
                         )
                         st.plotly_chart(fig, use_container_width=True)
-                        
+
                         st.markdown("#### Optimal Portfolio Weights")
                         optimal_weights = np.random.random(len(asset_returns))
                         optimal_weights /= np.sum(optimal_weights)
@@ -1012,10 +1009,10 @@ def run_dashboard():
                         st.dataframe(pd.DataFrame(weight_data), use_container_width=True, hide_index=True)
                 else:
                     st.info("Add at least 2 assets for portfolio analysis")
-        
+
         # AI Analysis
         st.markdown('<div class="section-header">🧠 AI Market Analysis</div>', unsafe_allow_html=True)
-        
+
         col_ai1, col_ai2 = st.columns([1, 3])
         with col_ai1:
             if st.button("Generate Insights", use_container_width=True):
@@ -1023,46 +1020,50 @@ def run_dashboard():
                     try:
                         if LlamaExplainer:
                             print("🤖 Generating AI insights...")
-                            explainer = LlamaExplainer()
-                            explanation = explainer.explain_simulation_results(
-                                tickers=stocks,
-                                expected_prices=expected_prices,
-                                confidence_intervals=confidence_intervals,
-                                risk_metrics=risk_metrics,
-                                variance_reduction=variance_reduction
-                            )
-                            st.session_state.explanation = explanation
-                            print("✅ AI insights generated")
+                            try:
+                                explainer = LlamaExplainer()
+                                explanation = explainer.explain_simulation_results(
+                                    tickers=stocks,
+                                    expected_prices=expected_prices,
+                                    confidence_intervals=confidence_intervals,
+                                    risk_metrics=risk_metrics,
+                                    variance_reduction=variance_reduction
+                                )
+                                st.session_state.explanation = explanation
+                                print("✅ AI insights generated")
+                            except Exception as llm_err:
+                                print(f"❌ LLM failed: {llm_err}")
+                                st.warning(f"AI analysis unavailable: {llm_err}")
                         else:
                             st.warning("LLM explainer not available")
                     except Exception as e:
                         print(f"❌ AI analysis failed: {e}")
                         st.error(f"AI analysis failed: {e}")
-        
+
         with col_ai2:
             if st.session_state.explanation:
                 st.markdown(f'<div class="info-box">{st.session_state.explanation}</div>', unsafe_allow_html=True)
             else:
                 st.markdown('<div class="info-box">Click "Generate Insights" for AI-powered market analysis</div>', unsafe_allow_html=True)
-        
+
         # Export
         st.markdown("---")
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             json_str = json.dumps(results, default=str, indent=2)
             st.download_button("📥 Export JSON", json_str, "results.json", use_container_width=True)
-        
+
         with col2:
             if expected_prices:
                 df_export = pd.DataFrame([{"Asset": k, "Forecast": v} for k, v in expected_prices.items()])
                 st.download_button("📊 Export CSV", df_export.to_csv(index=False), "prices.csv", use_container_width=True)
-        
+
         with col3:
             if risk_metrics:
                 df_risk_export = pd.DataFrame([{"Asset": k, **v} for k, v in risk_metrics.items()])
                 st.download_button("📉 Export Risk", df_risk_export.to_csv(index=False), "risk_metrics.csv", use_container_width=True)
-        
+
         with col4:
             if st.button("🔄 New Simulation", use_container_width=True):
                 st.session_state.results = None
