@@ -1,9 +1,8 @@
 """
 Professional Data Fetcher - 4-tier fallback with Webshare proxy
-Finnhub → Alpha Vantage → yfinance (via Webshare) → Synthetic
+Finnhub → Alpha Vantage → yfinance (via Webshare proxy) → Synthetic
 
-Finnhub free covers US markets only. Webshare proxy enables
-yfinance to work on Streamlit Cloud for international markets.
+Uses yfinance's `proxy=` parameter explicitly (env vars are ignored by yfinance).
 """
 
 import pandas as pd
@@ -51,11 +50,11 @@ _PROXY = _get_proxy_config()
 _PROXY_ENABLED = _PROXY is not None
 
 if _PROXY_ENABLED:
-    _url = _PROXY["http"]
-    os.environ['HTTP_PROXY'] = _url
-    os.environ['HTTPS_PROXY'] = _url
-    os.environ['http_proxy'] = _url
-    os.environ['https_proxy'] = _url
+    # Also set env vars for requests-based calls
+    os.environ['HTTP_PROXY'] = _PROXY["http"]
+    os.environ['HTTPS_PROXY'] = _PROXY["https"]
+    os.environ['http_proxy'] = _PROXY["http"]
+    os.environ['https_proxy'] = _PROXY["https"]
     print(f"✅ Webshare proxy configured: {_PROXY['http'].split('@')[-1]}")
 else:
     print("⚠️ Webshare proxy not configured")
@@ -93,6 +92,7 @@ class DataFetcher:
         # Proxy
         self.proxies = _get_proxy_config()
         self._proxy_enabled = self.proxies is not None
+        self._proxy_url = self.proxies["https"] if self.proxies else None
 
         # Finnhub SDK
         self.finnhub_client = None
@@ -147,7 +147,6 @@ class DataFetcher:
                     print(f"✅ Finnhub: {symbol} = ${price}")
                     return float(price)
         except Exception as e:
-            # 403 = free tier doesn't cover this market — quietly skip
             err_str = str(e)
             if "403" in err_str:
                 print(f"⏭️ Finnhub: {symbol} not covered by free tier")
@@ -186,36 +185,71 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 3: YFINANCE via Webshare proxy
+    # TIER 3: YFINANCE via Webshare proxy (explicit proxy param)
     # ============================================================
     def _call_yfinance(self, symbol: str) -> Optional[float]:
-        """yfinance — routed through Webshare proxy when configured"""
+        """yfinance — explicitly routed through Webshare proxy via yf.download(proxy=...)"""
         try:
             import yfinance as yf
 
-            ticker = yf.Ticker(symbol)
+            proxy_url = self._proxy_url
 
-            # Try fast_info first
+            # ---------- Try yf.download with explicit proxy ----------
             try:
-                price = ticker.fast_info.get('last_price')
-                if price and price > 0:
-                    tag = "via proxy" if self._proxy_enabled else "direct"
-                    print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
-                    return float(price)
-            except Exception:
-                pass
+                if proxy_url:
+                    hist = yf.download(
+                        symbol,
+                        period="5d",
+                        interval="1d",
+                        auto_adjust=False,
+                        progress=False,
+                        proxy=proxy_url,
+                        threads=False,
+                    )
+                else:
+                    hist = yf.download(
+                        symbol,
+                        period="5d",
+                        interval="1d",
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                    )
 
-            # Fallback: recent history
+                if hist is not None and not hist.empty:
+                    # Handle multi-index columns
+                    if isinstance(hist.columns, pd.MultiIndex):
+                        if ('Close', symbol) in hist.columns:
+                            close_series = hist[('Close', symbol)]
+                        elif 'Close' in hist.columns.get_level_values(0):
+                            close_series = hist.xs('Close', axis=1, level=0).iloc[:, 0]
+                        else:
+                            close_series = hist.iloc[:, 0]
+                    else:
+                        close_series = hist['Close']
+
+                    close_series = close_series.dropna()
+                    if len(close_series) > 0:
+                        price = float(close_series.iloc[-1])
+                        if price > 0:
+                            tag = "via proxy" if proxy_url else "direct"
+                            print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
+                            return price
+            except Exception as e:
+                print(f"⚠️ yfinance download failed for {symbol}: {e}")
+
+            # ---------- Fallback: Ticker.history ----------
             try:
+                ticker = yf.Ticker(symbol)
                 hist = ticker.history(period="5d", auto_adjust=False)
                 if not hist.empty and 'Close' in hist.columns:
-                    price = float(hist['Close'].iloc[-1])
+                    price = float(hist['Close'].dropna().iloc[-1])
                     if price > 0:
-                        tag = "via proxy" if self._proxy_enabled else "direct"
+                        tag = "via proxy" if proxy_url else "direct"
                         print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
                         return price
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ yfinance ticker.history failed for {symbol}: {e}")
 
         except Exception as e:
             print(f"⚠️ yfinance error for {symbol}: {e}")
@@ -246,19 +280,22 @@ class DataFetcher:
             price = None
             source = None
 
-            # Tier 1: Finnhub (US only)
+            # Tier 1: Finnhub
             price = self._call_finnhub(ticker)
-            if price: source = "Finnhub"
+            if price:
+                source = "Finnhub"
 
             # Tier 2: Alpha Vantage
             if price is None:
                 price = self._call_alpha_vantage(ticker)
-                if price: source = "Alpha Vantage"
+                if price:
+                    source = "Alpha Vantage"
 
-            # Tier 3: yfinance via Webshare proxy
+            # Tier 3: yfinance via proxy
             if price is None:
                 price = self._call_yfinance(ticker)
-                if price: source = "yfinance (proxy)"
+                if price:
+                    source = "yfinance (proxy)"
 
             if price is not None and price > 0:
                 prices[ticker] = price
@@ -310,33 +347,61 @@ class DataFetcher:
         for ticker in tickers:
             data = None
 
-            # ---- Tier 1: yfinance via proxy (BEST for full history) ----
+            # ---- Tier 1: yfinance via proxy ----
             if data is None:
                 try:
                     import yfinance as yf
                     from datetime import datetime as _dt, timedelta as _td
 
                     print(f"📡 Trying yfinance historical for {ticker}...")
-                    ticker_obj = yf.Ticker(ticker)
 
+                    proxy_url = self._proxy_url
                     end_dt = _dt.now()
                     start_dt = end_dt - _td(days=int(days * 1.6))
 
-                    hist = ticker_obj.history(
-                        start=start_dt.strftime("%Y-%m-%d"),
-                        end=end_dt.strftime("%Y-%m-%d"),
-                        auto_adjust=False,
-                        interval="1d"
-                    )
+                    if proxy_url:
+                        hist = yf.download(
+                            ticker,
+                            start=start_dt.strftime("%Y-%m-%d"),
+                            end=end_dt.strftime("%Y-%m-%d"),
+                            interval="1d",
+                            auto_adjust=False,
+                            progress=False,
+                            proxy=proxy_url,
+                            threads=False,
+                        )
+                    else:
+                        hist = yf.download(
+                            ticker,
+                            start=start_dt.strftime("%Y-%m-%d"),
+                            end=end_dt.strftime("%Y-%m-%d"),
+                            interval="1d",
+                            auto_adjust=False,
+                            progress=False,
+                            threads=False,
+                        )
 
-                    if not hist.empty and 'Close' in hist.columns:
-                        df = hist[['Close']].rename(columns={'Close': ticker})
-                        df.index = pd.to_datetime(df.index).tz_localize(None)
-                        if len(df) > days:
-                            df = df.iloc[-days:]
-                        data = df
-                        tag = "via proxy" if self._proxy_enabled else "direct"
-                        print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
+                    if hist is not None and not hist.empty:
+                        # Handle multi-index
+                        if isinstance(hist.columns, pd.MultiIndex):
+                            if ('Close', ticker) in hist.columns:
+                                close_series = hist[('Close', ticker)]
+                            elif 'Close' in hist.columns.get_level_values(0):
+                                close_series = hist.xs('Close', axis=1, level=0).iloc[:, 0]
+                            else:
+                                close_series = hist.iloc[:, 0]
+                        else:
+                            close_series = hist['Close']
+
+                        close_series = close_series.dropna()
+                        if len(close_series) > 0:
+                            df = close_series.to_frame(name=ticker)
+                            df.index = pd.to_datetime(df.index).tz_localize(None)
+                            if len(df) > days:
+                                df = df.iloc[-days:]
+                            data = df
+                            tag = "via proxy" if proxy_url else "direct"
+                            print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
                 except Exception as e:
                     print(f"⚠️ yfinance historical error for {ticker}: {e}")
 
