@@ -21,6 +21,15 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
+# ✅ Force yfinance to use curl_cffi impersonation (bypasses Yahoo cloud blocking)
+try:
+    from curl_cffi import requests as _curl_requests
+    import yfinance as _yf
+    _yf.set_tz_cache_location("/tmp/yfinance_cache")
+    print("✅ curl_cffi available for yfinance impersonation")
+except Exception as e:
+    print(f"⚠️ curl_cffi setup skipped: {e}")
+
 # Add root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
