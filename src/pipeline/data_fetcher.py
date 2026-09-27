@@ -1,10 +1,6 @@
 """
-Professional Data Fetcher - 4-tier fallback
-Finnhub → Alpha Vantage → yfinance (native curl_cffi) → Synthetic
-
-yfinance >= 0.2.54 has native curl_cffi support. When curl_cffi is
-installed, yfinance automatically impersonates Chrome — no session
-parameter needed.
+Professional Data Fetcher - Working on Streamlit Cloud
+Uses finnhub-python SDK (reliable) + Alpha Vantage + synthetic
 """
 
 import pandas as pd
@@ -22,11 +18,10 @@ logger = logging.getLogger(__name__)
 
 class DataFetcher:
     """
-    4-tier fallback:
-        1. Finnhub
-        2. Alpha Vantage
-        3. yfinance (with native curl_cffi impersonation)
-        4. Synthetic
+    Reliable multi-source fetcher:
+        1. Finnhub (via official SDK — works on cloud)
+        2. Alpha Vantage (25/day limit)
+        3. Synthetic (never fails)
     """
 
     def __init__(self, use_live_simulation: bool = False):
@@ -43,36 +38,28 @@ class DataFetcher:
 
         self.price_cache = {}
         self.cache_timestamp = {}
-        self.cache_duration = 60
+        self.cache_duration = 300  # 5 min — preserve AV quota
 
         self.historical_cache = {}
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
 
-        # ✅ Verify availability
-        self._yf_ok = False
-        self._curl_cffi_ok = False
-        try:
-            import yfinance as yf
-            self._yf_ok = True
-            print(f"   📊 yfinance version: {yf.__version__}")
-        except ImportError:
-            pass
-
-        try:
-            from curl_cffi import requests as _cr  # noqa: F401
-            self._curl_cffi_ok = True
-        except ImportError:
-            pass
+        # ✅ Initialize Finnhub SDK
+        self.finnhub_client = None
+        if self.finnhub_key:
+            try:
+                import finnhub
+                self.finnhub_client = finnhub.Client(api_key=self.finnhub_key)
+                print(f"   🔑 Finnhub SDK: ✅ initialized")
+            except ImportError:
+                print(f"   ⚠️ finnhub-python not installed")
+            except Exception as e:
+                print(f"   ⚠️ Finnhub SDK init failed: {e}")
 
         print("✅ DataFetcher initialized")
-        print(f"   🔑 Finnhub: {'✅' if self.finnhub_key else '❌'}")
+        print(f"   🔑 Finnhub: {'✅' if self.finnhub_client else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
-        print(f"   📊 yfinance: {'✅' if self._yf_ok else '❌'} (curl_cffi: {'✅' if self._curl_cffi_ok else '❌'})")
 
-    # ============================================================
-    # SAFE SECRETS ACCESS
-    # ============================================================
     def _get_alpha_vantage_key(self) -> str:
         try:
             if hasattr(st, 'secrets'):
@@ -96,35 +83,21 @@ class DataFetcher:
         return os.environ.get("FINNHUB_API_KEY", "") or ""
 
     # ============================================================
-    # ✅ YFINANCE HELPER — no session= passing!
-    #
-    # yfinance >= 0.2.54 uses curl_cffi automatically when installed.
-    # We must NOT pass session= — that API expects a specific type
-    # and breaks with the wrong curl_cffi version.
-    # ============================================================
-    def _make_yf_ticker(self, symbol: str):
-        """Create a plain yfinance Ticker — curl_cffi is used automatically."""
-        import yfinance as yf
-        return yf.Ticker(symbol)
-
-    # ============================================================
-    # TIER 1: FINNHUB
+    # TIER 1: FINNHUB via official SDK
     # ============================================================
     def _call_finnhub(self, symbol: str) -> Optional[float]:
-        if not self.finnhub_key:
+        if not self.finnhub_client:
             return None
         try:
-            url = "https://finnhub.io/api/v1/quote"
-            params = {"symbol": symbol, "token": self.finnhub_key}
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                price = data.get('c', 0)
+            # ✅ Use the SDK — handles headers, sessions, retries
+            quote = self.finnhub_client.quote(symbol)
+            if quote and isinstance(quote, dict):
+                price = quote.get('c', 0)
                 if price and price > 0:
                     print(f"✅ Finnhub: {symbol} = ${price}")
                     return float(price)
                 else:
-                    print(f"⚠️ Finnhub no data for {symbol}: {data}")
+                    print(f"⚠️ Finnhub returned 0 for {symbol} (delisted or unsupported)")
         except Exception as e:
             print(f"⚠️ Finnhub error for {symbol}: {e}")
         return None
@@ -159,42 +132,9 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # TIER 3: YFINANCE
-    # ============================================================
-    def _call_yfinance(self, symbol: str) -> Optional[float]:
-        """yfinance fallback — curl_cffi handled internally by yfinance"""
-        try:
-            ticker = self._make_yf_ticker(symbol)
-
-            # Try fast_info
-            try:
-                price = ticker.fast_info.get('last_price')
-                if price and price > 0:
-                    print(f"✅ yfinance: {symbol} = ${price:.2f}")
-                    return float(price)
-            except Exception as e:
-                print(f"⚠️ yfinance fast_info failed for {symbol}: {e}")
-
-            # Try history
-            try:
-                hist = ticker.history(period="5d", auto_adjust=False)
-                if not hist.empty and 'Close' in hist.columns:
-                    price = float(hist['Close'].iloc[-1])
-                    if price > 0:
-                        print(f"✅ yfinance: {symbol} = ${price:.2f}")
-                        return price
-            except Exception as e:
-                print(f"⚠️ yfinance history failed for {symbol}: {e}")
-
-        except Exception as e:
-            print(f"⚠️ yfinance error for {symbol}: {e}")
-        return None
-
-    # ============================================================
-    # CURRENT PRICES — 4-tier fallback
+    # CURRENT PRICES — 3-tier fallback (finnhub → AV → synthetic)
     # ============================================================
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
-        """Get current prices: Finnhub → AV → yfinance → synthetic"""
         now = time.time()
         prices = {}
         stale_tickers = []
@@ -216,16 +156,14 @@ class DataFetcher:
             price = None
             source = None
 
+            # Tier 1: Finnhub
             price = self._call_finnhub(ticker)
             if price: source = "Finnhub"
 
+            # Tier 2: Alpha Vantage
             if price is None:
                 price = self._call_alpha_vantage(ticker)
                 if price: source = "Alpha Vantage"
-
-            if price is None:
-                price = self._call_yfinance(ticker)
-                if price: source = "yfinance"
 
             if price is not None and price > 0:
                 prices[ticker] = price
@@ -260,7 +198,7 @@ class DataFetcher:
     # HISTORICAL DATA
     # ============================================================
     def get_historical_data(self, tickers_tuple: Tuple[str, ...], period: str = "1y") -> Optional[pd.DataFrame]:
-        """Historical data: yfinance → AV → synthetic"""
+        """Historical data via Finnhub stock_candles → AV → synthetic"""
 
         cache_key = f"{tickers_tuple}_{period}"
         now = time.time()
@@ -279,33 +217,32 @@ class DataFetcher:
         for ticker in tickers:
             data = None
 
-            # ---- Tier 1: yfinance (preferred — full history) ----
-            if data is None:
+            # ---- Tier 1: Finnhub candles ----
+            if data is None and self.finnhub_client:
                 try:
-                    from datetime import datetime as _dt, timedelta as _td
+                    end_ts = int(datetime.now().timestamp())
+                    start_ts = int((datetime.now() - timedelta(days=int(days * 1.6))).timestamp())
 
-                    print(f"📡 Trying yfinance historical for {ticker}...")
-                    ticker_obj = self._make_yf_ticker(ticker)
-
-                    end_dt = _dt.now()
-                    start_dt = end_dt - _td(days=int(days * 1.6))
-
-                    hist = ticker_obj.history(
-                        start=start_dt.strftime("%Y-%m-%d"),
-                        end=end_dt.strftime("%Y-%m-%d"),
-                        auto_adjust=False,
-                        interval="1d"
+                    print(f"📡 Trying Finnhub candles for {ticker}...")
+                    candles = self.finnhub_client.stock_candles(
+                        ticker, 'D', start_ts, end_ts
                     )
 
-                    if not hist.empty and 'Close' in hist.columns:
-                        df = hist[['Close']].rename(columns={'Close': ticker})
-                        df.index = pd.to_datetime(df.index).tz_localize(None)
-                        if len(df) > days:
-                            df = df.iloc[-days:]
-                        data = df
-                        print(f"✅ yfinance historical: {ticker} ({len(data)} days)")
+                    if candles and isinstance(candles, dict) and candles.get('s') == 'ok':
+                        closes = candles.get('c', [])
+                        timestamps = candles.get('t', [])
+                        if closes and timestamps:
+                            dates = pd.to_datetime(timestamps, unit='s')
+                            df = pd.DataFrame({ticker: closes}, index=dates)
+                            df = df.sort_index()
+                            if len(df) > days:
+                                df = df.iloc[-days:]
+                            data = df
+                            print(f"✅ Finnhub historical: {ticker} ({len(data)} days)")
+                    else:
+                        print(f"⚠️ Finnhub candles failed for {ticker} (may require paid tier)")
                 except Exception as e:
-                    print(f"⚠️ yfinance historical error for {ticker}: {e}")
+                    print(f"⚠️ Finnhub candles error for {ticker}: {e}")
 
             # ---- Tier 2: Alpha Vantage ----
             if data is None and self.alpha_vantage_key:
@@ -339,8 +276,7 @@ class DataFetcher:
                 base_price = 100.0
                 current_price = (
                     self._call_finnhub(ticker) or
-                    self._call_alpha_vantage(ticker) or
-                    self._call_yfinance(ticker)
+                    self._call_alpha_vantage(ticker)
                 )
                 if current_price:
                     base_price = current_price
@@ -385,46 +321,11 @@ class DataFetcher:
         return 252
 
     # ============================================================
-    # OPTION CHAIN
+    # OPTION CHAIN — stub (no reliable free source)
     # ============================================================
     def get_option_chain(self, ticker: str) -> Dict:
-        try:
-            stock = self._make_yf_ticker(ticker)
-            expirations = stock.options
-            if not expirations:
-                return {}
-
-            chain = stock.option_chain(expirations[0])
-
-            calls = []
-            for _, row in chain.calls.head(10).iterrows():
-                calls.append({
-                    'strike': float(row.get('strike', 0)),
-                    'lastPrice': float(row.get('lastPrice', 0)),
-                    'bid': float(row.get('bid', 0)),
-                    'ask': float(row.get('ask', 0)),
-                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
-                })
-
-            puts = []
-            for _, row in chain.puts.head(10).iterrows():
-                puts.append({
-                    'strike': float(row.get('strike', 0)),
-                    'lastPrice': float(row.get('lastPrice', 0)),
-                    'bid': float(row.get('bid', 0)),
-                    'ask': float(row.get('ask', 0)),
-                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
-                })
-
-            return {
-                'calls': calls,
-                'puts': puts,
-                'expiration': expirations[0],
-                'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
-            }
-        except Exception as e:
-            print(f"⚠️ Option chain error for {ticker}: {e}")
-            return {}
+        """Options data unavailable on cloud without a paid provider."""
+        return {}
 
     def get_data_source_info(self) -> str:
         return self.current_source
@@ -439,8 +340,7 @@ class DataFetcher:
             for ticker in tickers:
                 price = (
                     self._call_finnhub(ticker) or
-                    self._call_alpha_vantage(ticker) or
-                    self._call_yfinance(ticker)
+                    self._call_alpha_vantage(ticker)
                 )
                 self.live_prices[ticker] = price if price else 100
             self.is_running = True
