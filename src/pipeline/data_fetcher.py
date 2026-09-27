@@ -1,6 +1,6 @@
 """
-Professional Data Fetcher - Working on Streamlit Cloud
-Uses finnhub-python SDK (reliable) + Alpha Vantage + synthetic
+Professional Data Fetcher with Webshare Proxy Support
+Finnhub → Alpha Vantage → yfinance (via Webshare residential proxy) → Synthetic
 """
 
 import pandas as pd
@@ -16,12 +16,62 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# ✅ PROXY CONFIGURATION
+# ============================================================
+def _get_proxy_config():
+    """
+    Read Webshare proxy credentials from Streamlit secrets or env vars.
+    Returns dict compatible with requests' 'proxies' parameter, or None.
+    """
+    host = port = user = pw = None
+
+    # Try Streamlit secrets first
+    try:
+        if hasattr(st, 'secrets'):
+            host = st.secrets.get('WEBSHARE_PROXY_HOST', '') or host
+            port = st.secrets.get('WEBSHARE_PROXY_PORT', '') or port
+            user = st.secrets.get('WEBSHARE_PROXY_USER', '') or user
+            pw = st.secrets.get('WEBSHARE_PROXY_PASS', '') or pw
+    except Exception:
+        pass
+
+    # Fallback to env vars
+    host = host or os.environ.get('WEBSHARE_PROXY_HOST', '')
+    port = port or os.environ.get('WEBSHARE_PROXY_PORT', '')
+    user = user or os.environ.get('WEBSHARE_PROXY_USER', '')
+    pw = pw or os.environ.get('WEBSHARE_PROXY_PASS', '')
+
+    if not (host and port and user and pw):
+        return None
+
+    proxy_url = f"http://{user}:{pw}@{host}:{port}"
+    return {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+
+
+# Apply proxy to environment variables so yfinance picks it up automatically
+_PROXY = _get_proxy_config()
+if _PROXY:
+    _proxy_url = _PROXY["http"]
+    os.environ['HTTP_PROXY'] = _proxy_url
+    os.environ['HTTPS_PROXY'] = _proxy_url
+    os.environ['http_proxy'] = _proxy_url
+    os.environ['https_proxy'] = _proxy_url
+    print(f"✅ Webshare proxy configured: {_proxy_url.split('@')[-1]}")  # hide credentials
+else:
+    print("⚠️ Webshare proxy not configured — will use direct connection")
+
+
 class DataFetcher:
     """
-    Reliable multi-source fetcher:
-        1. Finnhub (via official SDK — works on cloud)
-        2. Alpha Vantage (25/day limit)
-        3. Synthetic (never fails)
+    4-tier fallback:
+        1. Finnhub
+        2. Alpha Vantage
+        3. yfinance (via Webshare proxy when configured)
+        4. Synthetic
     """
 
     def __init__(self, use_live_simulation: bool = False):
@@ -38,27 +88,30 @@ class DataFetcher:
 
         self.price_cache = {}
         self.cache_timestamp = {}
-        self.cache_duration = 300  # 5 min — preserve AV quota
+        self.cache_duration = 60
 
         self.historical_cache = {}
         self.historical_timestamp = {}
         self.historical_cache_duration = 3600
 
-        # ✅ Initialize Finnhub SDK
-        self.finnhub_client = None
-        if self.finnhub_key:
-            try:
-                import finnhub
-                self.finnhub_client = finnhub.Client(api_key=self.finnhub_key)
-                print(f"   🔑 Finnhub SDK: ✅ initialized")
-            except ImportError:
-                print(f"   ⚠️ finnhub-python not installed")
-            except Exception as e:
-                print(f"   ⚠️ Finnhub SDK init failed: {e}")
+        # Proxy config
+        self.proxies = _get_proxy_config()
+        self._proxy_enabled = self.proxies is not None
+
+        # Verify yfinance
+        self._yf_ok = False
+        try:
+            import yfinance as yf
+            self._yf_ok = True
+            print(f"   📊 yfinance version: {yf.__version__}")
+        except ImportError:
+            pass
 
         print("✅ DataFetcher initialized")
-        print(f"   🔑 Finnhub: {'✅' if self.finnhub_client else '❌'}")
+        print(f"   🔑 Finnhub: {'✅' if self.finnhub_key else '❌'}")
         print(f"   🔑 Alpha Vantage: {'✅' if self.alpha_vantage_key else '❌'}")
+        print(f"   📊 yfinance: {'✅' if self._yf_ok else '❌'}")
+        print(f"   🌐 Proxy: {'✅ enabled' if self._proxy_enabled else '❌ disabled'}")
 
     def _get_alpha_vantage_key(self) -> str:
         try:
@@ -83,21 +136,40 @@ class DataFetcher:
         return os.environ.get("FINNHUB_API_KEY", "") or ""
 
     # ============================================================
-    # TIER 1: FINNHUB via official SDK
+    # YFINANCE HELPER
+    # ============================================================
+    def _make_yf_ticker(self, symbol: str):
+        """
+        Create a yfinance Ticker.
+
+        When Webshare proxy env vars are set (HTTP_PROXY/HTTPS_PROXY),
+        yfinance uses them automatically. We also pass session=None
+        explicitly to avoid the earlier 'too many values to unpack' bug.
+        """
+        import yfinance as yf
+        return yf.Ticker(symbol)
+
+    # ============================================================
+    # TIER 1: FINNHUB
     # ============================================================
     def _call_finnhub(self, symbol: str) -> Optional[float]:
-        if not self.finnhub_client:
+        if not self.finnhub_key:
             return None
         try:
-            # ✅ Use the SDK — handles headers, sessions, retries
-            quote = self.finnhub_client.quote(symbol)
-            if quote and isinstance(quote, dict):
-                price = quote.get('c', 0)
+            url = "https://finnhub.io/api/v1/quote"
+            params = {"symbol": symbol, "token": self.finnhub_key}
+            response = requests.get(
+                url, params=params, timeout=10,
+                proxies=self.proxies if self._proxy_enabled else None
+            )
+            if response.status_code == 200:
+                data = response.json()
+                price = data.get('c', 0)
                 if price and price > 0:
                     print(f"✅ Finnhub: {symbol} = ${price}")
                     return float(price)
                 else:
-                    print(f"⚠️ Finnhub returned 0 for {symbol} (delisted or unsupported)")
+                    print(f"⚠️ Finnhub returned 0 for {symbol}")
         except Exception as e:
             print(f"⚠️ Finnhub error for {symbol}: {e}")
         return None
@@ -115,7 +187,10 @@ class DataFetcher:
                 "symbol": symbol,
                 "apikey": self.alpha_vantage_key
             }
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(
+                url, params=params, timeout=10,
+                proxies=self.proxies if self._proxy_enabled else None
+            )
             if response.status_code == 200:
                 data = response.json()
                 if "Global Quote" in data and data["Global Quote"]:
@@ -132,7 +207,38 @@ class DataFetcher:
         return None
 
     # ============================================================
-    # CURRENT PRICES — 3-tier fallback (finnhub → AV → synthetic)
+    # TIER 3: YFINANCE (uses env-var proxy automatically)
+    # ============================================================
+    def _call_yfinance(self, symbol: str) -> Optional[float]:
+        try:
+            ticker = self._make_yf_ticker(symbol)
+
+            try:
+                price = ticker.fast_info.get('last_price')
+                if price and price > 0:
+                    tag = "via proxy" if self._proxy_enabled else "direct"
+                    print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
+                    return float(price)
+            except Exception as e:
+                print(f"⚠️ yfinance fast_info failed for {symbol}: {e}")
+
+            try:
+                hist = ticker.history(period="5d", auto_adjust=False)
+                if not hist.empty and 'Close' in hist.columns:
+                    price = float(hist['Close'].iloc[-1])
+                    if price > 0:
+                        tag = "via proxy" if self._proxy_enabled else "direct"
+                        print(f"✅ yfinance ({tag}): {symbol} = ${price:.2f}")
+                        return price
+            except Exception as e:
+                print(f"⚠️ yfinance history failed for {symbol}: {e}")
+
+        except Exception as e:
+            print(f"⚠️ yfinance error for {symbol}: {e}")
+        return None
+
+    # ============================================================
+    # CURRENT PRICES
     # ============================================================
     def get_current_prices(self, tickers: List[str], force_refresh: bool = False) -> Dict[str, float]:
         now = time.time()
@@ -156,14 +262,16 @@ class DataFetcher:
             price = None
             source = None
 
-            # Tier 1: Finnhub
             price = self._call_finnhub(ticker)
             if price: source = "Finnhub"
 
-            # Tier 2: Alpha Vantage
             if price is None:
                 price = self._call_alpha_vantage(ticker)
                 if price: source = "Alpha Vantage"
+
+            if price is None:
+                price = self._call_yfinance(ticker)
+                if price: source = "yfinance"
 
             if price is not None and price > 0:
                 prices[ticker] = price
@@ -198,8 +306,6 @@ class DataFetcher:
     # HISTORICAL DATA
     # ============================================================
     def get_historical_data(self, tickers_tuple: Tuple[str, ...], period: str = "1y") -> Optional[pd.DataFrame]:
-        """Historical data via Finnhub stock_candles → AV → synthetic"""
-
         cache_key = f"{tickers_tuple}_{period}"
         now = time.time()
 
@@ -217,32 +323,34 @@ class DataFetcher:
         for ticker in tickers:
             data = None
 
-            # ---- Tier 1: Finnhub candles ----
-            if data is None and self.finnhub_client:
+            # ---- Tier 1: yfinance (via proxy) ----
+            if data is None:
                 try:
-                    end_ts = int(datetime.now().timestamp())
-                    start_ts = int((datetime.now() - timedelta(days=int(days * 1.6))).timestamp())
+                    from datetime import datetime as _dt, timedelta as _td
 
-                    print(f"📡 Trying Finnhub candles for {ticker}...")
-                    candles = self.finnhub_client.stock_candles(
-                        ticker, 'D', start_ts, end_ts
+                    print(f"📡 Trying yfinance historical for {ticker}...")
+                    ticker_obj = self._make_yf_ticker(ticker)
+
+                    end_dt = _dt.now()
+                    start_dt = end_dt - _td(days=int(days * 1.6))
+
+                    hist = ticker_obj.history(
+                        start=start_dt.strftime("%Y-%m-%d"),
+                        end=end_dt.strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        interval="1d"
                     )
 
-                    if candles and isinstance(candles, dict) and candles.get('s') == 'ok':
-                        closes = candles.get('c', [])
-                        timestamps = candles.get('t', [])
-                        if closes and timestamps:
-                            dates = pd.to_datetime(timestamps, unit='s')
-                            df = pd.DataFrame({ticker: closes}, index=dates)
-                            df = df.sort_index()
-                            if len(df) > days:
-                                df = df.iloc[-days:]
-                            data = df
-                            print(f"✅ Finnhub historical: {ticker} ({len(data)} days)")
-                    else:
-                        print(f"⚠️ Finnhub candles failed for {ticker} (may require paid tier)")
+                    if not hist.empty and 'Close' in hist.columns:
+                        df = hist[['Close']].rename(columns={'Close': ticker})
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                        if len(df) > days:
+                            df = df.iloc[-days:]
+                        data = df
+                        tag = "via proxy" if self._proxy_enabled else "direct"
+                        print(f"✅ yfinance ({tag}) historical: {ticker} ({len(data)} days)")
                 except Exception as e:
-                    print(f"⚠️ Finnhub candles error for {ticker}: {e}")
+                    print(f"⚠️ yfinance historical error for {ticker}: {e}")
 
             # ---- Tier 2: Alpha Vantage ----
             if data is None and self.alpha_vantage_key:
@@ -254,7 +362,10 @@ class DataFetcher:
                         "outputsize": "compact",
                         "apikey": self.alpha_vantage_key
                     }
-                    response = requests.get(url, params=params, timeout=10)
+                    response = requests.get(
+                        url, params=params, timeout=10,
+                        proxies=self.proxies if self._proxy_enabled else None
+                    )
                     if response.status_code == 200:
                         result = response.json()
                         if "Time Series (Daily)" in result:
@@ -276,7 +387,8 @@ class DataFetcher:
                 base_price = 100.0
                 current_price = (
                     self._call_finnhub(ticker) or
-                    self._call_alpha_vantage(ticker)
+                    self._call_alpha_vantage(ticker) or
+                    self._call_yfinance(ticker)
                 )
                 if current_price:
                     base_price = current_price
@@ -321,11 +433,46 @@ class DataFetcher:
         return 252
 
     # ============================================================
-    # OPTION CHAIN — stub (no reliable free source)
+    # OPTION CHAIN
     # ============================================================
     def get_option_chain(self, ticker: str) -> Dict:
-        """Options data unavailable on cloud without a paid provider."""
-        return {}
+        try:
+            stock = self._make_yf_ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                return {}
+
+            chain = stock.option_chain(expirations[0])
+
+            calls = []
+            for _, row in chain.calls.head(10).iterrows():
+                calls.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                })
+
+            puts = []
+            for _, row in chain.puts.head(10).iterrows():
+                puts.append({
+                    'strike': float(row.get('strike', 0)),
+                    'lastPrice': float(row.get('lastPrice', 0)),
+                    'bid': float(row.get('bid', 0)),
+                    'ask': float(row.get('ask', 0)),
+                    'volume': int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                })
+
+            return {
+                'calls': calls,
+                'puts': puts,
+                'expiration': expirations[0],
+                'underlying_price': float(chain.underlying['price']) if 'price' in chain.underlying else 0
+            }
+        except Exception as e:
+            print(f"⚠️ Option chain error for {ticker}: {e}")
+            return {}
 
     def get_data_source_info(self) -> str:
         return self.current_source
@@ -340,7 +487,8 @@ class DataFetcher:
             for ticker in tickers:
                 price = (
                     self._call_finnhub(ticker) or
-                    self._call_alpha_vantage(ticker)
+                    self._call_alpha_vantage(ticker) or
+                    self._call_yfinance(ticker)
                 )
                 self.live_prices[ticker] = price if price else 100
             self.is_running = True
