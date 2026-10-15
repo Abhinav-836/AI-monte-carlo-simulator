@@ -2,411 +2,220 @@
 Advanced Portfolio Optimization with Multiple Strategies
 """
 
-import numpy as np
-from scipy.optimize import minimize, differential_evolution
-from scipy import stats
-from typing import Dict, List, Tuple, Optional
-import pandas as pd
 import warnings
-warnings.filterwarnings('ignore')
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import differential_evolution, minimize
+
+warnings.filterwarnings("ignore")
 
 
 class PortfolioOptimizer:
-    """
-    Advanced portfolio optimizer with multiple optimization strategies
-    """
-    
-    def __init__(self, returns: np.ndarray, cov_matrix: np.ndarray):
-        """
-        Initialize optimizer
-        
-        Args:
-            returns: Expected returns for each asset
-            cov_matrix: Covariance matrix of asset returns
-        """
-        self.returns = np.asarray(returns)
-        self.cov_matrix = np.asarray(cov_matrix)
-        self.n_assets = len(returns)
-        
-        # Constraints and bounds
-        self.bounds = [(0, 1)] * self.n_assets
-        self.constraints = [
-            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
-        ]
-    
+    """`returns` and `cov_matrix` MUST be in the same frequency (both daily or both annual)."""
+
+    def __init__(self, returns: np.ndarray, cov_matrix: np.ndarray,
+                 asset_names: Optional[List[str]] = None):
+        self.returns = np.asarray(returns, float)
+        self.cov_matrix = np.asarray(cov_matrix, float)
+        self.n_assets = len(self.returns)
+        self.asset_names = list(asset_names) if asset_names is not None else None
+        self.bounds = [(0.0, 1.0)] * self.n_assets
+        self.constraints = [{"type": "eq", "fun": lambda x: np.sum(x) - 1.0}]
+        self._opts = {"ftol": 1e-10, "maxiter": 500}
+
+    # ---------------- helpers ----------------
+    def _vol(self, w: np.ndarray) -> float:
+        return float(np.sqrt(max(w @ self.cov_matrix @ w, 0.0)))
+
+    def _objective(self, method: str, rf: float) -> Callable[[np.ndarray], float]:
+        cov, mu, n = self.cov_matrix, self.returns, self.n_assets
+        asset_vol = np.sqrt(np.diag(cov))
+
+        if method == "sharpe":
+            return lambda w: -((w @ mu - rf) / (self._vol(w) + 1e-8))
+        if method == "min_vol":
+            return lambda w: float(w @ cov @ w)
+        if method == "max_return":
+            return lambda w: -float(w @ mu)
+        if method == "risk_parity":
+            def obj(w):
+                var = w @ cov @ w + 1e-12
+                rc = w * (cov @ w) / var            # fractional contributions (sum to 1)
+                return float(np.sum((rc - 1.0 / n) ** 2))   # well scaled -> SLSQP converges
+            return obj
+        if method == "max_diversification":
+            return lambda w: -float((w @ asset_vol) / (self._vol(w) + 1e-8))
+        raise ValueError(f"Unknown method: {method}")
+
+    def _clean(self, w: np.ndarray) -> np.ndarray:
+        w = np.clip(np.asarray(w, float), 0.0, 1.0)
+        s = w.sum()
+        return w / s if s > 1e-12 else np.ones(self.n_assets) / self.n_assets
+
+    def _solve(self, method: str, rf: float = 0.02, risk_tolerance: Optional[float] = None) -> Dict:
+        obj = self._objective(method, rf)
+        cons = list(self.constraints)
+        if method == "max_return" and risk_tolerance is not None:
+            cons.append({"type": "ineq", "fun": lambda x: risk_tolerance - self._vol(x)})
+
+        res = minimize(obj, np.ones(self.n_assets) / self.n_assets, method="SLSQP",
+                       bounds=self.bounds, constraints=cons, options=self._opts)
+        if res.success and np.all(np.isfinite(res.x)):
+            w = self._clean(res.x)
+        else:
+            w = self._fallback(obj, method, risk_tolerance)
+        return self._calculate_portfolio_stats(w, rf)
+
+    def _fallback(self, obj: Callable, method: str, risk_tolerance: Optional[float]) -> np.ndarray:
+        """Differential evolution with weight normalisation (DE can't take dict constraints)."""
+        def penalised(x):
+            w = self._clean(x)
+            val = obj(w)
+            if method == "max_return" and risk_tolerance is not None:
+                val += 1e3 * max(0.0, self._vol(w) - risk_tolerance)
+            return val
+
+        res = differential_evolution(penalised, bounds=self.bounds, maxiter=300, popsize=15,
+                                     seed=0, tol=1e-7, polish=False)
+        return self._clean(res.x) if np.all(np.isfinite(res.x)) else np.ones(self.n_assets) / self.n_assets
+
+    # ---------------- strategies ----------------
     def optimize_max_sharpe(self, risk_free_rate: float = 0.02) -> Dict:
-        """Optimize for maximum Sharpe ratio"""
-        
-        def objective(weights):
-            portfolio_return = np.sum(weights * self.returns)
-            portfolio_volatility = np.sqrt(weights.T @ self.cov_matrix @ weights)
-            sharpe = (portfolio_return - risk_free_rate) / (portfolio_volatility + 1e-8)
-            return -sharpe  # Minimize negative Sharpe
-        
-        result = minimize(
-            objective,
-            x0=np.ones(self.n_assets) / self.n_assets,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=self.constraints
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights, risk_free_rate)
-        else:
-            return self._fallback_optimization('sharpe', risk_free_rate)
-    
+        return self._solve("sharpe", risk_free_rate)
+
     def optimize_min_volatility(self) -> Dict:
-        """Optimize for minimum volatility"""
-        
-        def objective(weights):
-            return np.sqrt(weights.T @ self.cov_matrix @ weights)
-        
-        result = minimize(
-            objective,
-            x0=np.ones(self.n_assets) / self.n_assets,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=self.constraints
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights)
-        else:
-            return self._fallback_optimization('min_vol')
-    
+        return self._solve("min_vol")
+
     def optimize_max_return(self, risk_tolerance: float = 1.0) -> Dict:
-        """Optimize for maximum return with risk constraint"""
-        
-        def objective(weights):
-            return -np.sum(weights * self.returns)
-        
-        # Add risk constraint
-        constraints = self.constraints.copy()
-        constraints.append({
-            'type': 'ineq',
-            'fun': lambda x: risk_tolerance - np.sqrt(x.T @ self.cov_matrix @ x)
-        })
-        
-        result = minimize(
-            objective,
-            x0=np.ones(self.n_assets) / self.n_assets,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=constraints
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights)
-        else:
-            return self._fallback_optimization('max_return')
-    
+        return self._solve("max_return", risk_tolerance=risk_tolerance)
+
     def optimize_risk_parity(self) -> Dict:
-        """Optimize for risk parity (equal risk contribution)"""
-        
-        def objective(weights):
-            portfolio_vol = np.sqrt(weights.T @ self.cov_matrix @ weights)
-            marginal_contrib = (self.cov_matrix @ weights) / (portfolio_vol + 1e-8)
-            risk_contrib = weights * marginal_contrib
-            
-            # Target equal risk contribution
-            target = portfolio_vol / self.n_assets
-            return np.sum((risk_contrib - target) ** 2)
-        
-        result = minimize(
-            objective,
-            x0=np.ones(self.n_assets) / self.n_assets,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=self.constraints
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights)
-        else:
-            return self._fallback_optimization('risk_parity')
-    
+        return self._solve("risk_parity")
+
     def optimize_max_diversification(self) -> Dict:
-        """Optimize for maximum diversification ratio"""
-        
-        def objective(weights):
-            portfolio_vol = np.sqrt(weights.T @ self.cov_matrix @ weights)
-            weighted_vol = np.sum(weights * np.sqrt(np.diag(self.cov_matrix)))
-            diversification_ratio = weighted_vol / (portfolio_vol + 1e-8)
-            return -diversification_ratio
-        
-        result = minimize(
-            objective,
-            x0=np.ones(self.n_assets) / self.n_assets,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=self.constraints
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights)
-        else:
-            return self._fallback_optimization('max_diversification')
-    
-    def optimize_black_litterman(
-        self,
-        views: Dict[str, Tuple[float, float]],
-        tau: float = 0.05
-    ) -> Dict:
-        """
-        Black-Litterman optimization with views
-        
-        Args:
-            views: Dict of views {asset: (expected_return, uncertainty)}
-            tau: Confidence in prior
-        """
-        # Market capitalization weights (implied)
-        market_weights = np.ones(self.n_assets) / self.n_assets
-        
-        # Implied excess returns
-        lam = 2.5  # Risk aversion
-        pi = lam * self.cov_matrix @ market_weights
-        
-        # Views matrix
-        P = np.zeros((len(views), self.n_assets))
-        Q = np.zeros(len(views))
-        Omega = np.zeros((len(views), len(views)))
-        
-        for i, (asset, (view_return, view_uncertainty)) in enumerate(views.items()):
-            asset_idx = list(self.returns.keys()).index(asset) if isinstance(self.returns, dict) else i
-            P[i, asset_idx] = 1
-            Q[i] = view_return
-            Omega[i, i] = view_uncertainty
-        
-        # Black-Litterman posterior
-        tau_inv = tau
-        pi_inv = np.linalg.pinv(tau * self.cov_matrix)
-        P_inv = np.linalg.inv(P @ (tau * self.cov_matrix) @ P.T + Omega)
-        
-        # Posterior returns
-        posterior_returns = pi + (tau * self.cov_matrix) @ P.T @ P_inv @ (Q - P @ pi)
-        
-        # Optimize with posterior returns
-        original_returns = self.returns
-        self.returns = posterior_returns
-        
-        result = self.optimize_max_sharpe()
-        
-        # Restore original returns
-        self.returns = original_returns
-        
-        return result
-    
+        return self._solve("max_diversification")
+
+    def optimize_black_litterman(self, views: Dict[str, Tuple[float, float]], tau: float = 0.05,
+                                 risk_free_rate: float = 0.02) -> Dict:
+        """views: {asset: (expected_return, view_variance)}; needs asset_names."""
+        if self.asset_names is None:
+            raise ValueError("Pass asset_names to PortfolioOptimizer to use Black-Litterman views")
+
+        w_mkt = np.ones(self.n_assets) / self.n_assets
+        pi = 2.5 * self.cov_matrix @ w_mkt  # implied equilibrium returns
+
+        k = len(views)
+        P, Q, Omega = np.zeros((k, self.n_assets)), np.zeros(k), np.zeros((k, k))
+        for i, (asset, (q, unc)) in enumerate(views.items()):
+            P[i, self.asset_names.index(asset)] = 1.0
+            Q[i] = q
+            Omega[i, i] = max(float(unc), 1e-8)
+
+        tau_cov = tau * self.cov_matrix
+        posterior = pi + tau_cov @ P.T @ np.linalg.solve(P @ tau_cov @ P.T + Omega, Q - P @ pi)
+
+        original = self.returns
+        self.returns = posterior
+        try:
+            return self.optimize_max_sharpe(risk_free_rate)
+        finally:
+            self.returns = original
+
     def generate_efficient_frontier(self, n_points: int = 50) -> pd.DataFrame:
-        """Generate efficient frontier"""
-        results = []
-        
-        # Get min and max returns
-        min_return = np.min(self.returns)
-        max_return = np.max(self.returns)
-        
-        target_returns = np.linspace(min_return, max_return * 0.8, n_points)
-        
-        for target in target_returns:
-            # Constraint for target return
-            constraints = self.constraints.copy()
-            constraints.append({
-                'type': 'eq',
-                'fun': lambda x: np.sum(x * self.returns) - target
-            })
-            
-            result = minimize(
-                lambda x: np.sqrt(x.T @ self.cov_matrix @ x),
-                x0=np.ones(self.n_assets) / self.n_assets,
-                method='SLSQP',
-                bounds=self.bounds,
-                constraints=constraints
-            )
-            
-            if result.success:
-                weights = result.x
-                portfolio_return = np.sum(weights * self.returns)
-                portfolio_vol = np.sqrt(weights.T @ self.cov_matrix @ weights)
-                results.append({
-                    'return': portfolio_return,
-                    'volatility': portfolio_vol,
-                    'weights': weights
-                })
-        
-        return pd.DataFrame(results)
-    
+        min_vol = self.optimize_min_volatility()
+        r_lo = float(min_vol["return"])
+        r_hi = float(np.max(self.returns))
+        if r_hi <= r_lo:
+            return pd.DataFrame([{"return": r_lo, "volatility": min_vol["volatility"],
+                                  "weights": np.array(min_vol["weights"])}])
+
+        rows = []
+        for target in np.linspace(r_lo, r_hi, n_points):
+            cons = list(self.constraints) + [
+                {"type": "eq", "fun": lambda x, t=target: float(x @ self.returns) - t}]
+            res = minimize(lambda x: float(x @ self.cov_matrix @ x),
+                           np.ones(self.n_assets) / self.n_assets, method="SLSQP",
+                           bounds=self.bounds, constraints=cons, options=self._opts)
+            if res.success:
+                w = self._clean(res.x)
+                rows.append({"return": float(w @ self.returns), "volatility": self._vol(w), "weights": w})
+        return pd.DataFrame(rows)
+
     def _calculate_portfolio_stats(self, weights: np.ndarray, risk_free_rate: float = 0.02) -> Dict:
-        """Calculate portfolio statistics"""
-        portfolio_return = np.sum(weights * self.returns)
-        portfolio_vol = np.sqrt(weights.T @ self.cov_matrix @ weights)
-        sharpe = (portfolio_return - risk_free_rate) / (portfolio_vol + 1e-8)
-        
-        # Diversification ratio
-        weighted_vol = np.sum(weights * np.sqrt(np.diag(self.cov_matrix)))
-        diversification_ratio = weighted_vol / (portfolio_vol + 1e-8)
-        
-        # Maximum drawdown (estimated)
-        max_dd = -0.5 * np.max(weights * np.sqrt(np.diag(self.cov_matrix))) * 2.33
-        
+        w = np.asarray(weights, float)
+        ret = float(w @ self.returns)
+        vol = self._vol(w)
+        weighted_vol = float(w @ np.sqrt(np.diag(self.cov_matrix)))
         return {
-            'weights': weights.tolist(),
-            'return': float(portfolio_return),
-            'volatility': float(portfolio_vol),
-            'sharpe': float(sharpe),
-            'diversification_ratio': float(diversification_ratio),
-            'max_drawdown': float(max_dd)
+            "weights": w.tolist(),
+            "return": ret,
+            "volatility": vol,
+            "sharpe": float((ret - risk_free_rate) / (vol + 1e-8)),
+            "diversification_ratio": float(weighted_vol / (vol + 1e-8)),
+            # rough parametric heuristic (not a simulated drawdown), based on PORTFOLIO volatility
+            "max_drawdown": float(-0.5 * 2.33 * vol),
         }
-    
-    def _fallback_optimization(self, method: str, risk_free_rate: float = 0.02) -> Dict:
-        """Fallback optimization using differential evolution"""
-        
-        if method == 'sharpe':
-            objective = lambda x: -((np.sum(x * self.returns) - risk_free_rate) / (np.sqrt(x.T @ self.cov_matrix @ x) + 1e-8))
-        elif method == 'min_vol':
-            objective = lambda x: np.sqrt(x.T @ self.cov_matrix @ x)
-        elif method == 'max_return':
-            objective = lambda x: -np.sum(x * self.returns)
-        else:
-            objective = lambda x: np.sum((x - 1/self.n_assets) ** 2)
-        
-        result = differential_evolution(
-            objective,
-            bounds=[(0, 1)] * self.n_assets,
-            constraints=self.constraints,
-            maxiter=1000,
-            popsize=15
-        )
-        
-        if result.success:
-            weights = result.x
-            return self._calculate_portfolio_stats(weights, risk_free_rate)
-        else:
-            # Equal weight as fallback
-            weights = np.ones(self.n_assets) / self.n_assets
-            return self._calculate_portfolio_stats(weights, risk_free_rate)
-    
+
     @staticmethod
-    def optimize_portfolio(
-        returns: np.ndarray,
-        cov_matrix: np.ndarray,
-        method: str = 'max_sharpe',
-        risk_free_rate: float = 0.02,
-        **kwargs
-    ) -> Dict:
-        """
-        Static method for quick portfolio optimization
-        
-        Args:
-            returns: Expected returns
-            cov_matrix: Covariance matrix
-            method: 'max_sharpe', 'min_vol', 'max_return', 'risk_parity', 'max_diversification'
-            risk_free_rate: Risk-free rate
-            **kwargs: Additional arguments for specific methods
-        """
-        optimizer = PortfolioOptimizer(returns, cov_matrix)
-        
+    def optimize_portfolio(returns: np.ndarray, cov_matrix: np.ndarray, method: str = "max_sharpe",
+                           risk_free_rate: float = 0.02, asset_names: Optional[List[str]] = None,
+                           **kwargs) -> Dict:
+        opt = PortfolioOptimizer(returns, cov_matrix, asset_names)
+        if method == "max_sharpe":
+            return opt.optimize_max_sharpe(risk_free_rate, **kwargs)
         methods = {
-            'max_sharpe': optimizer.optimize_max_sharpe,
-            'min_vol': optimizer.optimize_min_volatility,
-            'max_return': optimizer.optimize_max_return,
-            'risk_parity': optimizer.optimize_risk_parity,
-            'max_diversification': optimizer.optimize_max_diversification
+            "min_vol": opt.optimize_min_volatility,
+            "max_return": opt.optimize_max_return,
+            "risk_parity": opt.optimize_risk_parity,
+            "max_diversification": opt.optimize_max_diversification,
         }
-        
-        if method in methods:
-            return methods[method](**kwargs)
-        else:
+        if method not in methods:
             raise ValueError(f"Unknown method: {method}")
+        return methods[method](**kwargs)
 
 
 class FactorModel:
-    """
-    Factor model for risk decomposition
-    """
-    
     def __init__(self, returns: np.ndarray, factor_returns: np.ndarray):
-        """
-        Initialize factor model
-        
-        Args:
-            returns: Asset returns (n_periods, n_assets)
-            factor_returns: Factor returns (n_periods, n_factors)
-        """
-        self.returns = returns
-        self.factor_returns = factor_returns
-        self.n_assets = returns.shape[1]
-        self.n_factors = factor_returns.shape[1]
-        self.betas = None
-        self.alpha = None
-        self.residuals = None
-        self.r_squared = None
-    
+        self.returns = np.asarray(returns, float)
+        fr = np.asarray(factor_returns, float)
+        self.factor_returns = fr.reshape(-1, 1) if fr.ndim == 1 else fr
+        self.n_assets = self.returns.shape[1]
+        self.n_factors = self.factor_returns.shape[1]
+        self.betas = self.alpha = self.residuals = self.r_squared = None
+
     def fit(self):
-        """Fit the factor model"""
-        # Calculate betas using OLS
+        X = np.column_stack([np.ones(len(self.factor_returns)), self.factor_returns])
         self.betas = np.zeros((self.n_assets, self.n_factors))
         self.alpha = np.zeros(self.n_assets)
         self.r_squared = np.zeros(self.n_assets)
         self.residuals = np.zeros(self.returns.shape)
-        
+
         for i in range(self.n_assets):
-            X = self.factor_returns
             y = self.returns[:, i]
-            
-            # Add constant
-            X_const = np.column_stack([np.ones(len(X)), X])
-            
-            # OLS
-            beta_hat = np.linalg.pinv(X_const.T @ X_const) @ X_const.T @ y
-            
-            self.alpha[i] = beta_hat[0]
-            self.betas[i] = beta_hat[1:]
-            
-            # Residuals
-            y_pred = X_const @ beta_hat
-            self.residuals[:, i] = y - y_pred
-            
-            # R-squared
-            ss_total = np.sum((y - np.mean(y)) ** 2)
-            ss_residual = np.sum(self.residuals[:, i] ** 2)
-            self.r_squared[i] = 1 - ss_residual / (ss_total + 1e-8)
-    
+            coef = np.linalg.lstsq(X, y, rcond=None)[0]
+            self.alpha[i], self.betas[i] = coef[0], coef[1:]
+            self.residuals[:, i] = y - X @ coef
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            self.r_squared[i] = 1 - np.sum(self.residuals[:, i] ** 2) / (ss_tot + 1e-12)
+
     def get_factor_exposures(self) -> Dict:
-        """Get factor exposures"""
-        return {
-            'betas': self.betas,
-            'alpha': self.alpha,
-            'r_squared': self.r_squared
-        }
-    
-    def calculate_factor_risk(self, weights: np.ndarray) -> Dict:
-        """Calculate factor and idiosyncratic risk"""
         if self.betas is None:
             self.fit()
-        
-        # Factor covariance
-        factor_cov = np.cov(self.factor_returns.T)
-        
-        # Factor risk
-        portfolio_betas = weights @ self.betas
-        factor_risk = portfolio_betas @ factor_cov @ portfolio_betas
-        
-        # Idiosyncratic risk
-        residual_variance = np.var(self.residuals, axis=0)
-        idio_risk = np.sum(weights ** 2 * residual_variance)
-        
-        # Total risk
-        total_risk = factor_risk + idio_risk
-        
+        return {"betas": self.betas, "alpha": self.alpha, "r_squared": self.r_squared}
+
+    def calculate_factor_risk(self, weights: np.ndarray) -> Dict:
+        if self.betas is None:
+            self.fit()
+        w = np.asarray(weights, float)
+        factor_cov = np.atleast_2d(np.cov(self.factor_returns, rowvar=False))  # 1-factor safe
+        port_betas = w @ self.betas
+        factor_risk = float(port_betas @ factor_cov @ port_betas)
+        idio_risk = float(np.sum(w ** 2 * np.var(self.residuals, axis=0, ddof=1)))
+        total = factor_risk + idio_risk
         return {
-            'total_risk': total_risk,
-            'factor_risk': factor_risk,
-            'idio_risk': idio_risk,
-            'factor_risk_pct': factor_risk / (total_risk + 1e-8),
-            'idio_risk_pct': idio_risk / (total_risk + 1e-8)
+            "total_risk": total, "factor_risk": factor_risk, "idio_risk": idio_risk,
+            "factor_risk_pct": factor_risk / (total + 1e-12),
+            "idio_risk_pct": idio_risk / (total + 1e-12),
         }

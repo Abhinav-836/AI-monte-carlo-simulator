@@ -1,17 +1,16 @@
 """
 DFMGAN - Discriminator-Filtered Monte Carlo GAN
-Fully fixed version (stable, memory-safe, production ready)
+Layers are built in __init__ (the lazy build happened AFTER the optimizers were created,
+so the projection layers and the discriminator were never trained).
 """
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
-from dataclasses import dataclass
 
 
-# =========================
-# CONFIG
-# =========================
 @dataclass
 class DFMGANConfig:
     n_assets: int = 3
@@ -21,174 +20,83 @@ class DFMGANConfig:
     n_simulations: int = 1000
     filter_top_k: float = 0.1
     batch_size_paths: int = 16
+    noise_std: float = 0.05
 
 
-# =========================
-# GENERATOR
-# =========================
 class ConditionalMCGenerator(nn.Module):
-    """Generator with stable sequence handling"""
-
     def __init__(self, config: DFMGANConfig):
         super().__init__()
         self.config = config
-        self.actual_n_assets = None
-
-        self.input_proj = None
-        self.output_proj = None
-
-        self.lstm = nn.LSTM(
-            input_size=config.latent_dim,
-            hidden_size=config.hidden_dim,
-            num_layers=1,
-            batch_first=True
-        )
-
-        # ✅ FIX: plain attributes (not registered buffers).
-        #         Buffers get moved by .to(device) and can conflict with
-        #         dynamic reassignment — using plain attrs avoids the
-        #         silent device mismatch that crashed on Streamlit.
-        self.hist_mean = None
-        self.hist_std = None
-
-    def _build_adaptive_layers(self, n_assets, device):
-        """Build layers dynamically"""
-        self.actual_n_assets = n_assets
-
-        self.input_proj = nn.Linear(n_assets, self.config.latent_dim).to(device)
-        self.output_proj = nn.Linear(self.config.hidden_dim, n_assets).to(device)
+        self.input_proj = nn.Linear(config.n_assets, config.latent_dim)
+        self.lstm = nn.LSTM(config.latent_dim, config.hidden_dim, num_layers=1, batch_first=True)
+        self.output_proj = nn.Linear(config.hidden_dim, config.n_assets)
 
     def forward(self, historical_data: torch.Tensor, n_paths: Optional[int] = None) -> torch.Tensor:
-        """Generate realistic Monte Carlo paths"""
-
-        if n_paths is None:
-            n_paths = min(self.config.n_simulations, 500)
-
-        n_paths = min(n_paths, 500)
-
+        n_paths = min(n_paths or self.config.n_simulations, 500)
         B, T, A = historical_data.shape
+        if A != self.config.n_assets:
+            raise ValueError(f"Generator built for {self.config.n_assets} assets, got {A}. "
+                             "Rebuild the models with the right n_assets.")
         device = historical_data.device
 
-        # Build layers dynamically only when asset count changes
-        if self.actual_n_assets != A:
-            self._build_adaptive_layers(A, device)
-
-        # Compute statistics as local tensors (avoids buffer leak)
         with torch.no_grad():
             hist_mean = historical_data.mean(dim=(0, 1))
-            hist_std = historical_data.std(dim=(0, 1)).clamp(min=1e-6)
+            hist_std = historical_data.std(dim=(0, 1), unbiased=False).clamp(min=1e-6)
 
-        # Fix sequence length
         target_T = self.config.seq_len
-
         if T > target_T:
             historical_data = historical_data[:, -target_T:, :]
         elif T < target_T:
-            pad_size = target_T - T
-            last_val = historical_data[:, -1:, :].repeat(1, pad_size, 1)
-            historical_data = torch.cat([historical_data, last_val], dim=1)
+            pad = historical_data[:, -1:, :].repeat(1, target_T - T, 1)
+            historical_data = torch.cat([historical_data, pad], dim=1)
 
-        # Normalize
-        hist_norm = (historical_data - hist_mean) / hist_std
+        hist_latent = self.input_proj((historical_data - hist_mean) / hist_std)
 
-        # Project
-        hist_latent = self.input_proj(hist_norm)
-
-        all_paths = []
-        batch_size = min(self.config.batch_size_paths, n_paths)
-
-        for i in range(0, n_paths, batch_size):
-            current_batch = min(batch_size, n_paths - i)
-
-            noise = torch.randn(
-                current_batch,
-                hist_latent.size(1),
-                hist_latent.size(2),
-                device=device
-            ) * 0.05
-
-            base = hist_latent[:1].repeat(current_batch, 1, 1)
-            noisy_input = base + noise
-
-            lstm_out, _ = self.lstm(noisy_input)
-            path_norm = self.output_proj(lstm_out)
-
-            # Denormalize
-            path = path_norm * hist_std + hist_mean
-            path = torch.clamp(path, min=1e-3)
-
-            all_paths.append(path)
-
-        return torch.cat(all_paths, dim=0)
+        out = []
+        step = min(self.config.batch_size_paths, n_paths)
+        for i in range(0, n_paths, step):
+            cb = min(step, n_paths - i)
+            idx = torch.arange(i, i + cb, device=device) % B   # condition on different real windows
+            base = hist_latent[idx]
+            noisy = base + torch.randn_like(base) * self.config.noise_std
+            lstm_out, _ = self.lstm(noisy)
+            path = self.output_proj(lstm_out) * hist_std + hist_mean
+            out.append(torch.clamp(path, min=1e-3))
+        return torch.cat(out, dim=0)
 
 
-# =========================
-# DISCRIMINATOR
-# =========================
 class TimeGANDiscriminator(nn.Module):
-    """Stable discriminator"""
+    """WGAN critic: raw score, NO sigmoid (a sigmoid breaks the Wasserstein loss / gradient penalty)."""
 
     def __init__(self, config: DFMGANConfig):
         super().__init__()
         self.config = config
-        self.actual_n_assets = None
-
-        self.conv = None
-        self.fc = None
+        self.conv = nn.Conv1d(config.n_assets, 16, kernel_size=3, padding=1)
         self.pool = nn.AdaptiveAvgPool1d(1)
-
-    def _build_adaptive_layers(self, n_assets, device):
-        self.actual_n_assets = n_assets
-        self.conv = nn.Conv1d(n_assets, 16, kernel_size=3, padding=1).to(device)
-        self.fc = nn.Linear(16, 1).to(device)
+        self.fc = nn.Linear(16, 1)
 
     def forward(self, paths: torch.Tensor) -> torch.Tensor:
-        B, T, A = paths.shape
-        device = paths.device
-
-        if self.actual_n_assets != A:
-            self._build_adaptive_layers(A, device)
-
-        x = paths.transpose(1, 2)  # (B, A, T)
-
-        x = torch.relu(self.conv(x))
-        x = self.pool(x).squeeze(-1)
-
-        logits = self.fc(x)
-
-        return torch.sigmoid(logits)
+        if paths.size(-1) != self.config.n_assets:
+            raise ValueError(f"Critic built for {self.config.n_assets} assets, got {paths.size(-1)}")
+        # scale-free: compare shapes of paths, not price levels
+        rel = paths / (paths[:, :1, :].abs() + 1e-8) - 1.0
+        x = torch.relu(self.conv(rel.transpose(1, 2)))
+        return self.fc(self.pool(x).squeeze(-1))
 
 
-# =========================
-# PATH FILTER
-# =========================
 class PathFilter:
-    """Filters top realistic paths"""
-
     def __init__(self, discriminator: TimeGANDiscriminator):
         self.discriminator = discriminator
         self.discriminator.eval()
 
-    def filter_paths(
-        self,
-        generated_paths: torch.Tensor,
-        top_k: float = 0.1,
-        batch_size: int = 32
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        n_paths = generated_paths.size(0)
-        scores_list = []
-
+    def filter_paths(self, generated_paths: torch.Tensor, top_k: float = 0.1,
+                     batch_size: int = 32) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = []
+        device = next(self.discriminator.parameters()).device
         with torch.no_grad():
-            for i in range(0, n_paths, batch_size):
-                batch = generated_paths[i:i + batch_size]
-                scores = self.discriminator(batch)
-                scores_list.append(scores.squeeze().cpu())
-
-        scores = torch.cat(scores_list)
-
-        k = max(1, int(n_paths * top_k))
-
-        top_indices = torch.topk(scores, k=k).indices
-
-        return generated_paths[top_indices], scores
+            for i in range(0, generated_paths.size(0), batch_size):
+                s = self.discriminator(generated_paths[i:i + batch_size].to(device))
+                scores.append(s.flatten().cpu())   # flatten (not squeeze): batch of 1 would crash torch.cat
+        scores = torch.cat(scores)
+        k = max(1, int(generated_paths.size(0) * top_k))
+        return generated_paths[torch.topk(scores, k=k).indices], scores

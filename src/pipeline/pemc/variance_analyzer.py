@@ -1,19 +1,19 @@
 """
 Variance analysis for PEMC
-Calculates and visualizes variance reduction
 """
 
-import numpy as np
-import torch
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
+EPS = 1e-12
+
 
 @dataclass
 class VarianceMetrics:
-    """Container for variance analysis results"""
     mc_variance: float
     pemc_variance: float
     variance_reduction: float
@@ -21,317 +21,125 @@ class VarianceMetrics:
     sample_efficiency: float
     optimal_allocation: Dict[str, float]
 
+
 class VarianceAnalyzer:
-    """
-    Analyzes variance reduction achieved by PEMC
-    Provides optimal sample allocation and efficiency metrics
-    """
-    
     def __init__(self):
         self.metrics_history = []
-        
-    def calculate_variance_reduction(
-        self,
-        mc_estimates: np.ndarray,
-        pemc_estimates: np.ndarray
-    ) -> float:
-        """
-        Calculate variance reduction percentage
-        
-        Args:
-            mc_estimates: Estimates from standard Monte Carlo
-            pemc_estimates: Estimates from PEMC
-        
-        Returns:
-            Variance reduction (0-1)
-        """
+
+    def calculate_variance_reduction(self, mc_estimates: np.ndarray, pemc_estimates: np.ndarray) -> float:
         mc_var = np.var(mc_estimates, ddof=1)
         pemc_var = np.var(pemc_estimates, ddof=1)
-        
-        reduction = (mc_var - pemc_var) / mc_var
-        return max(0, min(1, reduction))  # Clip to [0,1]
-    
-    def calculate_confidence_interval_width(
-        self,
-        estimates: np.ndarray,
-        confidence: float = 0.95
-    ) -> float:
-        """
-        Calculate confidence interval width
-        
-        Args:
-            estimates: Array of estimates
-            confidence: Confidence level
-        
-        Returns:
-            Width of confidence interval
-        """
+        return float(max(0.0, min(1.0, (mc_var - pemc_var) / (mc_var + EPS))))
+
+    def calculate_confidence_interval_width(self, estimates: np.ndarray, confidence: float = 0.95) -> float:
         from scipy import stats
-        
-        mean = np.mean(estimates)
-        std = np.std(estimates, ddof=1)
-        n = len(estimates)
-        
-        se = std / np.sqrt(n)
-        z_score = stats.norm.ppf(1 - (1 - confidence) / 2)
-        
-        ci_width = 2 * z_score * se
-        return ci_width
-    
-    def analyze_variance_reduction(
-        self,
-        mc_estimates: np.ndarray,
-        pemc_estimates: np.ndarray,
-        confidence: float = 0.95
-    ) -> VarianceMetrics:
-        """
-        Comprehensive variance reduction analysis
-        
-        Args:
-            mc_estimates: Standard MC estimates
-            pemc_estimates: PEMC estimates
-            confidence: Confidence level
-        
-        Returns:
-            VarianceMetrics object with detailed analysis
-        """
-        # Calculate variances
+        se = np.std(estimates, ddof=1) / np.sqrt(len(estimates))
+        return float(2 * stats.norm.ppf(1 - (1 - confidence) / 2) * se)
+
+    def analyze_variance_reduction(self, mc_estimates: np.ndarray, pemc_estimates: np.ndarray,
+                                   confidence: float = 0.95) -> VarianceMetrics:
         mc_var = np.var(mc_estimates, ddof=1)
         pemc_var = np.var(pemc_estimates, ddof=1)
-        
-        # Variance reduction
-        reduction = (mc_var - pemc_var) / mc_var
-        
-        # Confidence interval width reduction
-        mc_ci_width = self.calculate_confidence_interval_width(mc_estimates, confidence)
-        pemc_ci_width = self.calculate_confidence_interval_width(pemc_estimates, confidence)
-        ci_reduction = (mc_ci_width - pemc_ci_width) / mc_ci_width
-        
-        # Sample efficiency
-        # How many fewer samples PEMC needs to achieve same variance
-        sample_efficiency = mc_var / pemc_var
-        
-        # Optimal allocation (simplified)
-        optimal_n = 1000  # Placeholder
-        optimal_N = int(optimal_n * sample_efficiency)
-        
-        optimal_allocation = {
-            'n_coupled': optimal_n,
-            'n_independent': optimal_N,
-            'ratio': optimal_N / optimal_n
-        }
-        
+        mc_w = self.calculate_confidence_interval_width(mc_estimates, confidence)
+        pemc_w = self.calculate_confidence_interval_width(pemc_estimates, confidence)
+        efficiency = mc_var / (pemc_var + EPS)
+
+        n = 1000
+        N = int(n * efficiency)
         metrics = VarianceMetrics(
-            mc_variance=mc_var,
-            pemc_variance=pemc_var,
-            variance_reduction=reduction,
-            ci_width_reduction=ci_reduction,
-            sample_efficiency=sample_efficiency,
-            optimal_allocation=optimal_allocation
+            mc_variance=float(mc_var), pemc_variance=float(pemc_var),
+            variance_reduction=float((mc_var - pemc_var) / (mc_var + EPS)),
+            ci_width_reduction=float((mc_w - pemc_w) / (mc_w + EPS)),
+            sample_efficiency=float(efficiency),
+            optimal_allocation={"n_coupled": n, "n_independent": N, "ratio": N / n},
         )
-        
-        # Store in history
         self.metrics_history.append(metrics)
-        
         return metrics
-    
-    def optimal_allocation(
-        self,
-        sigma_f: float,
-        sigma_g: float,
-        rho: float,
-        cost_ratio: float = 10.0
-    ) -> Dict[str, float]:
+
+    def optimal_allocation(self, sigma_f: float, sigma_g: float, rho: float,
+                           cost_ratio: float = 10.0, budget: float = 10000.0) -> Dict[str, float]:
         """
-        Compute optimal sample allocation between coupled and independent samples
-        
-        Based on PEMC theory: 
-        Optimal ratio = sqrt( (σ²_f|g / c_f) / (σ²_g / c_g) )
-        
-        Args:
-            sigma_f: Standard deviation of target f(Y)
-            sigma_g: Standard deviation of predictor g(θ,X)
-            rho: Correlation between f and g
-            cost_ratio: Cost of expensive simulation / cost of cheap ML evaluation
-        
-        Returns:
-            Dictionary with optimal n, N, and expected variance
+        Minimise  sigma_f^2 (1-rho^2)/n + rho^2 sigma_f^2 / N   s.t.  n*cost_ratio + N = budget
+        (control-variate term is beta^2 sigma_g^2 = rho^2 sigma_f^2).
+        Lagrange solution: N/n = rho*sqrt(cost_ratio)/sqrt(1-rho^2).
         """
-        # Conditional variance of f given g
-        sigma_f_given_g = sigma_f**2 * (1 - rho**2)
-        
-        # Optimal ratio n/N
-        optimal_ratio = np.sqrt(
-            (sigma_f_given_g / 1.0) / (sigma_g**2 / cost_ratio)
-        )
-        
-        # For a given computational budget, solve for n and N
-        # Total cost = n * c_f + N * c_g
-        # With c_g = 1, c_f = cost_ratio
-        
-        budget = 10000  # Example budget
-        
-        n_optimal = budget / (cost_ratio + 1/optimal_ratio)
-        N_optimal = n_optimal * optimal_ratio
-        
-        # Expected variance
-        expected_var = sigma_f_given_g / n_optimal + sigma_g**2 / N_optimal
-        
+        rho = float(np.clip(abs(rho), 0.0, 0.999999))
+        ratio = rho * np.sqrt(cost_ratio) / np.sqrt(1 - rho ** 2)
+        n_opt = budget / (cost_ratio + ratio)
+        N_opt = n_opt * ratio
+        expected_var = sigma_f ** 2 * (1 - rho ** 2) / max(n_opt, 1e-9)
+        if N_opt > 0:
+            expected_var += rho ** 2 * sigma_f ** 2 / N_opt
         return {
-            'n_optimal': int(n_optimal),
-            'N_optimal': int(N_optimal),
-            'ratio': optimal_ratio,
-            'expected_variance': expected_var,
-            'expected_std': np.sqrt(expected_var)
+            "n_optimal": int(n_opt), "N_optimal": int(N_opt), "ratio": float(ratio),
+            "expected_variance": float(expected_var), "expected_std": float(np.sqrt(expected_var)),
         }
-    
-    def plot_variance_comparison(
-        self,
-        mc_estimates: np.ndarray,
-        pemc_estimates: np.ndarray,
-        save_path: Optional[str] = None
-    ):
-        """
-        Plot variance comparison
-        
-        Args:
-            mc_estimates: Standard MC estimates
-            pemc_estimates: PEMC estimates
-            save_path: Optional path to save plot
-        """
+
+    def plot_variance_comparison(self, mc_estimates: np.ndarray, pemc_estimates: np.ndarray,
+                                 save_path: Optional[str] = None):
+        """Returns a matplotlib Figure (use st.pyplot(fig)); no plt.show(), which doesn't work on Streamlit."""
         try:
-            import matplotlib.pyplot as plt
-            
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            
-            # 1. Histogram comparison
-            axes[0, 0].hist(mc_estimates, bins=50, alpha=0.5, label='Standard MC', density=True)
-            axes[0, 0].hist(pemc_estimates, bins=50, alpha=0.5, label='PEMC', density=True)
-            axes[0, 0].set_xlabel('Estimate')
-            axes[0, 0].set_ylabel('Density')
-            axes[0, 0].set_title('Distribution of Estimates')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # 2. Box plot
-            axes[0, 1].boxplot([mc_estimates, pemc_estimates], labels=['Standard MC', 'PEMC'])
-            axes[0, 1].set_ylabel('Estimate')
-            axes[0, 1].set_title('Box Plot Comparison')
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # 3. Convergence plot
-            n_samples = len(mc_estimates)
-            mc_cummean = np.cumsum(mc_estimates) / np.arange(1, n_samples + 1)
-            pemc_cummean = np.cumsum(pemc_estimates) / np.arange(1, n_samples + 1)
-            
-            axes[1, 0].plot(mc_cummean, label='Standard MC', alpha=0.7)
-            axes[1, 0].plot(pemc_cummean, label='PEMC', alpha=0.7)
-            axes[1, 0].axhline(y=np.mean(mc_estimates), color='gray', linestyle='--', alpha=0.5)
-            axes[1, 0].set_xlabel('Number of Samples')
-            axes[1, 0].set_ylabel('Cumulative Mean')
-            axes[1, 0].set_title('Convergence')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # 4. Variance reduction bar chart
-            mc_var = np.var(mc_estimates, ddof=1)
-            pemc_var = np.var(pemc_estimates, ddof=1)
-            reduction = (mc_var - pemc_var) / mc_var * 100
-            
-            axes[1, 1].bar(['Standard MC', 'PEMC'], [mc_var, pemc_var], color=['red', 'green'])
-            axes[1, 1].set_ylabel('Variance')
-            axes[1, 1].set_title(f'Variance Reduction: {reduction:.1f}%')
-            
-            # Add text on bars
-            for i, v in enumerate([mc_var, pemc_var]):
-                axes[1, 1].text(i, v + 0.001, f'{v:.4f}', ha='center')
-            
-            axes[1, 1].grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            plt.show()
-            
+            from matplotlib.figure import Figure
         except ImportError:
             logger.warning("Matplotlib not available for plotting")
-    
-    def calculate_sample_efficiency(
-        self,
-        mc_var: float,
-        pemc_var: float,
-        target_variance: float
-    ) -> Dict[str, float]:
-        """
-        Calculate sample efficiency to achieve target variance
-        
-        Args:
-            mc_var: Variance of standard MC
-            pemc_var: Variance of PEMC
-            target_variance: Desired variance level
-        
-        Returns:
-            Dictionary with required samples for each method
-        """
-        mc_samples_needed = mc_var / target_variance
-        pemc_samples_needed = pemc_var / target_variance
-        
-        efficiency = mc_samples_needed / pemc_samples_needed
-        
+            return None
+
+        fig = Figure(figsize=(12, 10))
+        ax = fig.subplots(2, 2)
+
+        ax[0, 0].hist(mc_estimates, bins=50, alpha=0.5, label="Standard MC", density=True)
+        ax[0, 0].hist(pemc_estimates, bins=50, alpha=0.5, label="PEMC", density=True)
+        ax[0, 0].set(xlabel="Estimate", ylabel="Density", title="Distribution of Estimates")
+        ax[0, 0].legend()
+
+        ax[0, 1].boxplot([mc_estimates, pemc_estimates])
+        ax[0, 1].set_xticklabels(["Standard MC", "PEMC"])
+        ax[0, 1].set(ylabel="Estimate", title="Box Plot Comparison")
+
+        k = np.arange(1, len(mc_estimates) + 1)
+        k2 = np.arange(1, len(pemc_estimates) + 1)
+        ax[1, 0].plot(np.cumsum(mc_estimates) / k, label="Standard MC", alpha=0.7)
+        ax[1, 0].plot(np.cumsum(pemc_estimates) / k2, label="PEMC", alpha=0.7)
+        ax[1, 0].set(xlabel="Number of Samples", ylabel="Cumulative Mean", title="Convergence")
+        ax[1, 0].legend()
+
+        mc_var, pemc_var = np.var(mc_estimates, ddof=1), np.var(pemc_estimates, ddof=1)
+        red = (mc_var - pemc_var) / (mc_var + EPS) * 100
+        ax[1, 1].bar(["Standard MC", "PEMC"], [mc_var, pemc_var], color=["red", "green"])
+        ax[1, 1].set(ylabel="Variance", title=f"Variance Reduction: {red:.1f}%")
+
+        for a in ax.flat:
+            a.grid(True, alpha=0.3)
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        return fig
+
+    def calculate_sample_efficiency(self, mc_var: float, pemc_var: float,
+                                    target_variance: float) -> Dict[str, float]:
+        mc_n = mc_var / target_variance
+        pemc_n = pemc_var / target_variance
+        eff = mc_n / (pemc_n + EPS)
         return {
-            'mc_samples_needed': int(mc_samples_needed),
-            'pemc_samples_needed': int(pemc_samples_needed),
-            'efficiency_ratio': efficiency,
-            'time_savings': (1 - 1/efficiency) * 100 if efficiency > 1 else 0
+            "mc_samples_needed": int(mc_n), "pemc_samples_needed": int(pemc_n),
+            "efficiency_ratio": float(eff),
+            "time_savings": float((1 - 1 / eff) * 100) if eff > 1 else 0.0,
         }
-    
-    def theoretical_variance_reduction(
-        self,
-        rho: float,
-        n_coupled: int,
-        n_independent: int,
-        sigma_f: float = 1.0,
-        sigma_g: float = 1.0
-    ) -> float:
-        """
-        Calculate theoretical variance reduction
-        
-        Args:
-            rho: Correlation between f and g
-            n_coupled: Number of coupled samples
-            n_independent: Number of independent samples
-            sigma_f: Std dev of f
-            sigma_g: Std dev of g
-        
-        Returns:
-            Theoretical variance reduction
-        """
-        # Standard MC variance
-        var_mc = sigma_f**2 / n_coupled
-        
-        # PEMC variance
-        var_pemc = sigma_f**2 * (1 - rho**2) / n_coupled + sigma_g**2 / n_independent
-        
-        reduction = (var_mc - var_pemc) / var_mc
-        return max(0, min(1, reduction))
-    
+
+    def theoretical_variance_reduction(self, rho: float, n_coupled: int, n_independent: int,
+                                       sigma_f: float = 1.0, sigma_g: float = 1.0) -> float:
+        """PEMC variance = s_f^2(1-rho^2)/n + beta^2 s_g^2/N, with beta*s_g = rho*s_f.
+        (sigma_g kept in the signature for compatibility; it cancels out.)"""
+        var_mc = sigma_f ** 2 / n_coupled
+        var_pemc = sigma_f ** 2 * (1 - rho ** 2) / n_coupled + (rho * sigma_f) ** 2 / n_independent
+        return float(max(0.0, min(1.0, (var_mc - var_pemc) / var_mc)))
+
     def get_summary_stats(self) -> Dict:
-        """
-        Get summary statistics from analysis history
-        
-        Returns:
-            Dictionary with summary statistics
-        """
         if not self.metrics_history:
             return {}
-        
-        reductions = [m.variance_reduction for m in self.metrics_history]
-        
+        red = [m.variance_reduction for m in self.metrics_history]
         return {
-            'mean_reduction': np.mean(reductions),
-            'std_reduction': np.std(reductions),
-            'max_reduction': np.max(reductions),
-            'min_reduction': np.min(reductions),
-            'num_analyses': len(reductions)
+            "mean_reduction": float(np.mean(red)), "std_reduction": float(np.std(red)),
+            "max_reduction": float(np.max(red)), "min_reduction": float(np.min(red)),
+            "num_analyses": len(red),
         }

@@ -6,7 +6,6 @@ import numpy as np
 from scipy import stats
 from typing import Tuple, List, Optional, Dict
 import pandas as pd
-from sklearn.utils import resample
 
 
 class ConfidenceIntervalCalculator:
