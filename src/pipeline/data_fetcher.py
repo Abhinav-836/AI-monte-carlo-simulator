@@ -51,9 +51,15 @@ def _get_key(name: str) -> str:
 
 
 @st.cache_resource
-def get_data_fetcher(use_live_simulation: bool = False):
-    """One persistent DataFetcher per Streamlit server process (shared caches + rate limiter)."""
+def _shared_fetcher(use_live_simulation: bool) -> "DataFetcher":
     return DataFetcher(use_live_simulation=use_live_simulation)
+
+
+def get_data_fetcher(use_live_simulation: bool = False) -> "DataFetcher":
+    """One persistent DataFetcher per server process (shared caches + one rate limiter).
+    Always calls the cached function with the same positional form so every caller
+    gets the same instance — st.cache_resource keys on args exactly as passed."""
+    return _shared_fetcher(bool(use_live_simulation))
 
 
 class DataFetcher:

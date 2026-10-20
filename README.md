@@ -1,135 +1,102 @@
- 🚀 AI-Powered Monte Carlo Stock Simulator with Generative Models
+# 🚀 AI-Powered Monte Carlo Stock Simulator
 
-An advanced financial simulation system that combines **Monte Carlo methods**, **Generative Adversarial Networks (TimeGAN & DFMGAN)**, and **LLM-driven insights** to model, simulate, and analyze global stock market behavior.
+Monte Carlo simulation of global stock prices with optional generative models (WGAN-GP "DFMGAN"),
+prediction-enhanced variance reduction (PEMC), portfolio optimisation, risk analytics and an
+optional LLM that explains the results.
 
----
-
- 📌 Overview
-
-This project is designed to simulate realistic stock price movements using both **statistical methods** and **deep generative models**. It enhances traditional Monte Carlo simulations by incorporating **synthetic time-series data generation**, enabling more robust and diverse financial forecasting.
-
-The system also integrates a **Large Language Model (LLM)** to provide human-like, AI-generated insights based on simulation outputs.
+> ⚠️ **Disclaimer:** educational and research use only. Not financial advice.
 
 ---
 
- 🧠 Key Features
+## 📌 What it does
 
-- 📊 **Monte Carlo Simulation**
-  - Probabilistic modeling of stock price movements
-  - Scenario-based forecasting
+| Module | What it really does |
+|---|---|
+| **Monte Carlo** | Correlated GBM with jumps (Ledoit-Wolf covariance). Risk statistics use *all* simulated paths. |
+| **DFMGAN** | WGAN-GP path generator + critic filter. **Optional**: used only when a trained checkpoint is loaded; otherwise the pipeline falls back to GBM. |
+| **PEMC** | Neural control variate for option payoffs (Asian / barrier / variance swap / European). Standalone; see notebook 03. |
+| **Risk & performance** | VaR/CVaR, Sharpe, Sortino, Calmar, drawdowns, capture ratios, Kelly, etc. |
+| **Optimisation** | Max-Sharpe, min-vol, risk-parity, max-diversification, Black-Litterman, efficient frontier. |
+| **LLM explainer** | Natural-language summary of simulation output (needs a local Ollama server). |
 
-- 🧬 **Synthetic Data Generation**
-  - TimeGAN for realistic time-series synthesis
-  - DFMGAN for improved distribution fidelity
+## 🌍 Market data
 
-- 🌍 **Real-Time Market Data**
-  - Integrated with `yfinance` API
-  - Supports global stock analysis
+Prices come from a multi-tier fallback that never fabricates data:
 
-- 🤖 **LLM-Based Insight Engine**
-  - Generates contextual financial insights
-  - Explains trends, risks, and potential outcomes
+- Current price: Twelve Data → Finnhub (US only) → yfinance → Yahoo chart API → Alpha Vantage → last real cached price
+- Historical: Twelve Data → yfinance → Yahoo chart API → Alpha Vantage
 
-- 📈 **Multi-Stock Analysis**
-  - Compare multiple assets
-  - Evaluate volatility and trends
+If a ticker can't be fetched it is reported in `results["metadata"]["missing_tickers"]` instead of silently dropped.
+Free-tier limits apply (Twelve Data: 8 requests/min). Non-US exchanges may not be covered by every free plan.
+Yahoo can throttle shared cloud IPs.
 
----
+## ⚙️ Setup
 
- ⚙️ Tech Stack
+```bash
+pip install -r requirements.txt          # add requirements-dev.txt for tests/notebooks
+```
 
-- **Programming Language:** Python  
-- **Data Source:** yfinance  
-- **Machine Learning:**
-  - TimeGAN
-  - DFMGAN  
-- **Simulation:** Monte Carlo Methods  
-- **AI Layer:** LLM (for insights generation)  
-- **Libraries:**
-  - NumPy
-  - Pandas
-  - Matplotlib / Plotly
-  - TensorFlow / PyTorch (for GANs)
+API keys (all optional, more keys = better coverage):
 
----
+- **Local:** put them in `.env` (never committed)
+- **Streamlit Cloud:** *Manage app → Settings → Secrets*
 
- 🏗️ System Architecture
+```toml
+TWELVE_DATA_API_KEY = "..."
+FINNHUB_API_KEY = "..."
+ALPHA_VANTAGE_API_KEY = "..."
+```
 
-        +----------------------+
-        |   yFinance API       |
-        +----------+-----------+
-                   |
-                   v
-        +----------------------+
-        |   Data Preprocessing |
-        +----------+-----------+
-                   |
-    +--------------+--------------+
-    |                             |
-    v                             v
-+------------------+ +------------------+
-| TimeGAN Model | | DFMGAN Model |
-+--------+---------+ +--------+---------+
-| |
-+-------------+-------------+
-|
-v
-+----------------------+
-|  Data Engine         |
-+----------+-----------+
-|
-v
-+----------------------+
-| Monte Carlo Simulator|
-+----------+-----------+
-|
-v
-+----------------------+
-| LLM Insight Engine |
-+----------+-----------+
-|
-v
-+----------------------+
-| Output & Visualization|
-+----------------------+
+Run the app (adjust the filename to your entry point):
 
----
- 📊 How It Works
+```bash
+streamlit run app.py
+```
 
-1. Fetch historical stock data using `yfinance`
-2. Preprocess and normalize time-series data
-3. Train TimeGAN and DFMGAN models on historical data
-4. Generate synthetic stock price sequences
-5. Run Monte Carlo simulations on both real and synthetic data
-6. Analyze:
-   - Price distributions
-   - Volatility
-   - Trend patterns
-7. Use LLM to generate:
-   - Market insights
-   - Risk analysis
-   - Scenario explanations
+## 🧪 Tests and notebooks
 
----
- 📸 Example Outputs
-- Simulated price paths
-- Probability distributions of future prices
-- Risk metrics (volatility, drawdowns)
-- AI-generated financial insights
+```bash
+pytest -q                                              # no network, no API keys needed
+jupyter nbconvert --to notebook --execute notebooks/01_data_exploration.ipynb --output /tmp/nb01.ipynb
+```
 
----
- 🧪 Future Improvements
+## 🧠 Training the GAN
 
-- 📉 Add advanced risk metrics (VaR, Sharpe Ratio)
-- 📊 Interactive dashboard (Streamlit / React)
-- 🧠 Fine-tuned financial LLM for better insights
-- 🔍 Validation tests (KS Test, distribution comparison)
-- ⚡ Real-time simulation updates
+Run `notebooks/02_dfmgan_training.ipynb`. It writes `data/models/dfmgan.pth`.
+Commit that file (see `.gitignore`) so the deployed app can load it, then:
 
----
-⚠️ Disclaimer
-This project is for educational and research purposes only.
-It does not provide financial advice. Always consult a financial expert before making investment decisions.
+```python
+pipeline = MonteCarloPipeline(n_assets=3, use_gan=True)
+pipeline.load_models(checkpoint_path="data/models/dfmgan.pth")
+```
 
-👨‍💻 Author
+The network sizes in the notebook must match the `DFMGANConfig` defaults, otherwise loading fails and the pipeline falls back to GBM.
+
+## 🏗️ Architecture
+
+```
+ Market data (multi-provider fallback)
+              │
+              ▼
+ Feature engineering (leak-free)
+              │
+     ┌────────┴─────────┐
+     ▼                  ▼
+ GBM + jumps      DFMGAN (optional, trained checkpoint)
+     └────────┬─────────┘
+              ▼
+ Path simulation ──► Risk metrics / CIs ──► Optimiser
+              │
+              ▼
+ LLM explainer (optional) ──► Streamlit UI
+```
+
+## ⚠️ Known limitations
+
+- `variance_reduction` in the pipeline output compares simulated vs historical return variance. It is **not** PEMC variance reduction.
+- Expected returns estimated from 1–2 years of history are very noisy; max-Sharpe weights are sensitive to them.
+- Simulated paths are 60 steps (~59 trading days).
+
+## 👨‍💻 Author
+
 Abhinav Ashutosh

@@ -1,24 +1,88 @@
 """
-Prompt templates (FIXED + OPTIMIZED for small LLMs like LLaMA 3.1 / gpt-oss)
+Prompt templates for the LLM explainer (single source of truth for every prompt).
+Missing / NaN values are written as "n/a" — never as a fake 0 the model would treat as data.
 """
 
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
+
+from src.market_utils import format_price, is_number
+
+UNITS_NOTE = (
+    "Units: prices are in each asset's local currency (LSE quotes are in pence). "
+    "'Daily VaR' is the 1-day 95% loss threshold of simulated log returns. "
+    "'Drift' and 'Vol' are annualised from the simulation (drift is estimated from recent history). "
+    "'Sharpe' uses a 2% risk-free rate. 'Avg drawdown' is the average worst decline per simulated path."
+)
 
 
 class PromptTemplates:
-    """Optimized prompt templates for small LLM performance"""
 
     # ================= SAFE FORMATTERS =================
     @staticmethod
-    def _safe_float(val, default=0.0):
-        try:
-            return float(val)
-        except:
-            return default
+    def _num(val) -> Optional[float]:
+        return float(val) if is_number(val) else None
 
     @staticmethod
-    def _safe_pct(val):
+    def _safe_float(val, default: float = 0.0) -> float:
+        f = PromptTemplates._num(val)
+        return default if f is None else f
+
+    @staticmethod
+    def _safe_pct(val) -> float:
         return PromptTemplates._safe_float(val) * 100
+
+    @staticmethod
+    def _fmt(val, spec: str = ".2f", scale: float = 1.0, suffix: str = "") -> str:
+        f = PromptTemplates._num(val)
+        return "n/a" if f is None else f"{f * scale:{spec}}{suffix}"
+
+    @staticmethod
+    def _pct(val, spec: str = ".1f") -> str:
+        return PromptTemplates._fmt(val, spec, 100.0, "%")
+
+    @staticmethod
+    def _price(val, ticker: str) -> str:
+        p = format_price(val, ticker)
+        return "n/a" if p == "—" else p
+
+    @staticmethod
+    def _ci(ci, ticker: str) -> str:
+        if isinstance(ci, (list, tuple)) and len(ci) >= 2:
+            return f"{PromptTemplates._price(ci[0], ticker)} to {PromptTemplates._price(ci[1], ticker)}"
+        return "n/a"
+
+    @staticmethod
+    def _horizon(h) -> str:
+        return f"{int(float(h))} trading days" if is_number(h) and float(h) > 0 else "the simulation horizon"
+
+    @staticmethod
+    def _asset_line(t: str, expected_prices: Dict, confidence_intervals: Dict, risk_metrics: Dict) -> str:
+        P = PromptTemplates
+        r = (risk_metrics or {}).get(t) or {}
+        return (
+            f"- {t}: expected {P._price((expected_prices or {}).get(t), t)} "
+            f"(95% range {P._ci((confidence_intervals or {}).get(t), t)}), "
+            f"daily VaR {P._pct(r.get('var_95'), '.2f')}, drift {P._pct(r.get('expected_return'))}, "
+            f"vol {P._pct(r.get('volatility'))}, Sharpe {P._fmt(r.get('sharpe'))}, "
+            f"avg drawdown {P._pct(r.get('max_drawdown'))}"
+        )
+
+    @staticmethod
+    def _insights_block(insights: Optional[Dict[str, Any]]) -> str:
+        if not insights or not insights.get("best_performer"):
+            return ""
+        P = PromptTemplates
+        lines = [
+            f"- Overall tone: {insights.get('overall_sentiment', 'n/a')}",
+            f"- Highest Sharpe: {insights['best_performer']} ({P._fmt(insights.get('best_sharpe'))}); "
+            f"lowest: {insights.get('worst_performer')} ({P._fmt(insights.get('worst_sharpe'))})",
+            f"- Average Sharpe {P._fmt(insights.get('average_sharpe'))}, average daily VaR "
+            f"{P._pct(insights.get('average_var'), '.2f')}, average vol {P._pct(insights.get('average_volatility'))}",
+        ]
+        signals = insights.get("signals") or {}
+        if signals:
+            lines.append("- Mechanical screen: " + ", ".join(f"{t}={s}" for t, s in signals.items()))
+        return "RULE-BASED SCREEN (computed mechanically from the data above):\n" + "\n".join(lines)
 
     # ================= SIMULATION SUMMARY =================
     @staticmethod
@@ -27,108 +91,61 @@ class PromptTemplates:
         expected_prices: Dict[str, float],
         confidence_intervals: Dict[str, List[float]],
         risk_metrics: Dict[str, Dict[str, float]],
-        variance_reduction: float
+        variance_reduction: Optional[float] = None,   # kept for compatibility; not a model-quality metric
+        horizon_days: Optional[int] = None,
     ) -> str:
-
-        ticker_section = ""
-
-        for ticker in tickers:
-            price = PromptTemplates._safe_float(expected_prices.get(ticker))
-            ci = confidence_intervals.get(ticker, [0, 0])
-
-            ci_low = PromptTemplates._safe_float(ci[0] if len(ci) > 0 else 0)
-            ci_high = PromptTemplates._safe_float(ci[1] if len(ci) > 1 else 0)
-
-            risk = risk_metrics.get(ticker, {})
-
-            ticker_section += (
-                f"{ticker}: "
-                f"Price=${price:.2f}, "
-                f"CI=[{ci_low:.2f},{ci_high:.2f}], "
-                f"VaR={PromptTemplates._safe_pct(risk.get('var_95')):.1f}%, "
-                f"Return={PromptTemplates._safe_pct(risk.get('expected_return')):.1f}%, "
-                f"Sharpe={PromptTemplates._safe_float(risk.get('sharpe')):.2f}\n"
-            )
-
-        return f"""Act as a financial analyst.
-
-DATA:
-{ticker_section}
-
-Model variance reduction: {variance_reduction*100:.1f}%
-
-Write 3 short paragraphs:
-1. Outlook
-2. Risks
-3. Recommendation
-
-Keep it concise and professional.
-"""
+        P = PromptTemplates
+        lines = "\n".join(P._asset_line(t, expected_prices, confidence_intervals, risk_metrics) for t in tickers)
+        return (
+            f"Act as a financial analyst. Monte Carlo horizon: {P._horizon(horizon_days)}.\n\n"
+            f"DATA:\n{lines}\n\n{UNITS_NOTE}\n\n"
+            "Write 3 short paragraphs:\n1. Outlook\n2. Risks\n3. What the numbers suggest "
+            "(educational, not advice)\n\nKeep it concise and use only the data above."
+        )
 
     # ================= RISK ANALYSIS =================
     @staticmethod
     def risk_analysis(
         tickers: List[str],
         risk_metrics: Dict[str, Dict[str, float]],
-        variance_reduction: float
+        variance_reduction: Optional[float] = None,
     ) -> str:
-
+        P = PromptTemplates
         lines = []
-
-        for ticker in tickers:
-            r = risk_metrics.get(ticker, {})
+        for t in tickers:
+            r = (risk_metrics or {}).get(t) or {}
             lines.append(
-                f"{ticker}: "
-                f"VaR={PromptTemplates._safe_pct(r.get('var_95')):.1f}%, "
-                f"CVaR={PromptTemplates._safe_pct(r.get('cvar_95')):.1f}%, "
-                f"Sharpe={PromptTemplates._safe_float(r.get('sharpe')):.2f}, "
-                f"DD={PromptTemplates._safe_pct(r.get('max_drawdown')):.1f}%"
+                f"- {t}: daily VaR {P._pct(r.get('var_95'), '.2f')}, daily CVaR {P._pct(r.get('cvar_95'), '.2f')}, "
+                f"Sharpe {P._fmt(r.get('sharpe'))}, avg drawdown {P._pct(r.get('max_drawdown'))}, "
+                f"worst drawdown {P._pct(r.get('worst_drawdown'))}"
             )
-
-        return f"""Act as a risk analyst.
-
-RISK DATA:
-{chr(10).join(lines)}
-
-Variance reduction: {variance_reduction*100:.1f}%
-
-Explain:
-- Highest risk asset
-- Best risk-adjusted return
-- Drawdown concerns
-- Risk mitigation
-"""
+        body = "\n".join(lines)
+        return (
+            f"Act as a risk analyst.\n\nRISK DATA:\n{body}\n\n{UNITS_NOTE}\n\n"
+            "Explain:\n- Highest-risk asset\n- Best risk-adjusted return\n- Drawdown concerns\n- Risk mitigation ideas"
+        )
 
     # ================= COMPARE =================
     @staticmethod
     def compare_assets(
         tickers: List[str],
         expected_prices: Dict[str, float],
-        risk_metrics: Dict[str, Dict[str, float]]
+        risk_metrics: Dict[str, Dict[str, float]],
     ) -> str:
-
+        P = PromptTemplates
         lines = []
-
-        for ticker in tickers:
-            exp = PromptTemplates._safe_float(expected_prices.get(ticker))
-            r = risk_metrics.get(ticker, {})
-
+        for t in tickers:
+            r = (risk_metrics or {}).get(t) or {}
             lines.append(
-                f"{ticker}: Price={exp:.2f}, "
-                f"Vol={PromptTemplates._safe_pct(r.get('volatility')):.1f}%, "
-                f"Sharpe={PromptTemplates._safe_float(r.get('sharpe')):.2f}"
+                f"- {t}: expected {P._price((expected_prices or {}).get(t), t)}, "
+                f"vol {P._pct(r.get('volatility'))}, Sharpe {P._fmt(r.get('sharpe'))}"
             )
-
-        return f"""Act as a portfolio manager.
-
-ASSETS:
-{chr(10).join(lines)}
-
-Explain:
-- Best asset
-- Risk vs return tradeoff
-- Allocation suggestion
-"""
+        body = "\n".join(lines)
+        return (
+            f"Act as a portfolio analyst.\n\nASSETS:\n{body}\n\n{UNITS_NOTE}\n\n"
+            "Explain:\n- Strongest risk-adjusted profile\n- Risk vs return trade-off\n"
+            "- How weights could be balanced (educational, not advice)"
+        )
 
     # ================= QA =================
     @staticmethod
@@ -137,30 +154,20 @@ Explain:
         expected_prices: Dict[str, float],
         confidence_intervals: Dict[str, List[float]],
         risk_metrics: Dict[str, Dict[str, float]],
-        variance_reduction: float,
-        question: str
+        variance_reduction: Optional[float],
+        question: str,
+        insights: Optional[Dict[str, Any]] = None,
+        horizon_days: Optional[int] = None,
     ) -> str:
-
-        summary = []
-
-        for t in tickers:
-            price = PromptTemplates._safe_float(expected_prices.get(t))
-            ci = confidence_intervals.get(t, [0, 0])
-
-            summary.append(
-                f"{t}: Price={price:.2f}, "
-                f"CI=[{ci[0]:.2f},{ci[1]:.2f}], "
-                f"VaR={PromptTemplates._safe_pct(risk_metrics.get(t, {}).get('var_95')):.1f}%"
-            )
-
-        return f"""Use ONLY this data:
-
-{chr(10).join(summary)}
-
-Question: {question}
-
-Answer clearly. If unknown, say "Insufficient data".
-"""
+        P = PromptTemplates
+        lines = "\n".join(P._asset_line(t, expected_prices, confidence_intervals, risk_metrics) for t in tickers)
+        screen = P._insights_block(insights)
+        return (
+            f"Use ONLY this Monte Carlo data (horizon: {P._horizon(horizon_days)}):\n\n{lines}\n\n"
+            f"{UNITS_NOTE}\n\n{screen}\n\n"
+            f"QUESTION: {question}\n\n"
+            "Answer clearly. If the data cannot answer it, say \"Insufficient data\" and explain what is missing."
+        )
 
     # ================= SCENARIO =================
     @staticmethod
@@ -168,33 +175,21 @@ Answer clearly. If unknown, say "Insufficient data".
         tickers: List[str],
         base_results: Dict[str, Any],
         scenario_results: Dict[str, Any],
-        scenario_description: str
+        scenario_description: str,
     ) -> str:
-
-        base_exp = base_results.get('expected_prices', {})
-        scen_exp = scenario_results.get('expected_prices', {})
-
-        comparison = []
-
-        for ticker in tickers:
-            b = PromptTemplates._safe_float(base_exp.get(ticker))
-            s = PromptTemplates._safe_float(scen_exp.get(ticker))
-
-            change_pct = ((s - b) / b * 100) if b != 0 else 0
-
-            comparison.append(
-                f"{ticker}: {b:.2f} → {s:.2f} ({change_pct:+.1f}%)"
-            )
-
-        return f"""Scenario: {scenario_description}
-
-{chr(10).join(comparison)}
-
-Explain:
-- Impact on returns
-- Risk change
-- Key insight
-"""
+        P = PromptTemplates
+        base_exp = (base_results or {}).get("expected_prices", {})
+        scen_exp = (scenario_results or {}).get("expected_prices", {})
+        lines = []
+        for t in tickers:
+            b, s = P._num(base_exp.get(t)), P._num(scen_exp.get(t))
+            change = f"{(s / b - 1) * 100:+.1f}%" if b and s is not None else "n/a"
+            lines.append(f"- {t}: {P._price(b, t)} -> {P._price(s, t)} ({change})")
+        body = "\n".join(lines)
+        return (
+            f"Scenario: {scenario_description}\n\n{body}\n\n"
+            "Explain:\n- Impact on expected prices\n- Risk change\n- Key insight"
+        )
 
     # ================= EXECUTIVE =================
     @staticmethod
@@ -202,28 +197,40 @@ Explain:
         tickers: List[str],
         expected_prices: Dict[str, float],
         risk_metrics: Dict[str, Dict[str, float]],
-        variance_reduction: float
+        variance_reduction: Optional[float] = None,
     ) -> str:
+        P = PromptTemplates
+        lines = []
+        for t in tickers:
+            r = (risk_metrics or {}).get(t) or {}
+            lines.append(f"- {t}: {P._price((expected_prices or {}).get(t), t)}, "
+                         f"Sharpe {P._fmt(r.get('sharpe'))}, daily VaR {P._pct(r.get('var_95'), '.2f')}")
+        body = "\n".join(lines)
+        return (
+            f"Executive summary data:\n\n{body}\n\n{UNITS_NOTE}\n\n"
+            "Give:\n- Key takeaway\n- Biggest risk\n- One thing to watch"
+        )
 
-        bullets = []
-
-        for ticker in tickers:
-            exp = PromptTemplates._safe_float(expected_prices.get(ticker))
-            sharpe = PromptTemplates._safe_float(risk_metrics.get(ticker, {}).get('sharpe'))
-            var = PromptTemplates._safe_pct(risk_metrics.get(ticker, {}).get('var_95'))
-
-            bullets.append(
-                f"{ticker}: ${exp:.2f}, Sharpe={sharpe:.2f}, VaR={var:.1f}%"
-            )
-
-        return f"""Executive summary:
-
-{chr(10).join(bullets)}
-
-Variance reduction: {variance_reduction*100:.1f}%
-
-Give:
-- Key takeaway
-- Biggest risk
-- One action
-"""
+    # ================= COMPREHENSIVE (used by the explainer) =================
+    @staticmethod
+    def comprehensive_analysis(
+        tickers: List[str],
+        expected_prices: Dict[str, float],
+        confidence_intervals: Dict[str, List[float]],
+        risk_metrics: Dict[str, Dict[str, float]],
+        insights: Optional[Dict[str, Any]] = None,
+        horizon_days: Optional[int] = None,
+    ) -> str:
+        P = PromptTemplates
+        lines = "\n".join(P._asset_line(t, expected_prices, confidence_intervals, risk_metrics) for t in tickers)
+        screen = P._insights_block(insights)
+        return (
+            f"Analyse this Monte Carlo simulation (horizon: {P._horizon(horizon_days)}).\n\n"
+            f"ASSET DATA:\n{lines}\n\n{UNITS_NOTE}\n\n{screen}\n\n"
+            "Respond in Markdown with these sections:\n\n"
+            "## 📊 Executive summary\n(2-3 sentences)\n\n"
+            "## 📈 Asset by asset\n(2-3 lines per asset: expected move, range, risk)\n\n"
+            "## ⚠️ Key risks\n(3-4 bullets, including model limitations)\n\n"
+            "## 💡 Insights\n(2-3 bullets)\n\n"
+            "Be concise and quantitative. Do not invent numbers that are not in the data."
+        )

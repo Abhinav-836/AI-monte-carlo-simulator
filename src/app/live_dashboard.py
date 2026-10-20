@@ -1,244 +1,189 @@
 """
-Live Dashboard Component - Real-Time Price & Performance Tracking
+Reusable dashboard components: price cards, risk charts, rule-based screen.
+Real data only — no simulated "live" ticks.
 """
 
-import streamlit as st
-import pandas as pd
+import html
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-import time
-import threading
-from typing import Dict, List, Optional
+
+from src.market_utils import format_price
+from src.app.utils import safe_float
+
+COLORS = ["#6366f1", "#8b5cf6", "#ec4899", "#10b981", "#f59e0b", "#06b6d4", "#ef4444", "#84cc16"]
+
+
+def render_price_cards(tickers: List[str], prices: Dict[str, float],
+                       history: Optional[Dict[str, list]] = None,
+                       sources: Optional[Dict[str, str]] = None, max_cards: int = 8):
+    shown = tickers[:max_cards]
+    if not shown:
+        return
+    cols = st.columns(len(shown))
+    for col, t in zip(cols, shown):
+        hist = (history or {}).get(t, [])
+        change_html = '<span style="color:#64748b;">—</span>'
+        if len(hist) >= 2 and hist[-2]["price"] > 0:
+            ch = (hist[-1]["price"] / hist[-2]["price"] - 1) * 100
+            color = "#10b981" if ch >= 0 else "#ef4444"
+            change_html = (f'<span style="color:{color};">{"↑" if ch >= 0 else "↓"} {ch:+.2f}%</span>'
+                           '<span style="color:#64748b;font-size:0.7rem;"> since last refresh</span>')
+        src = html.escape((sources or {}).get(t, "") or "")
+        col.markdown(f"""
+        <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:0.8rem;
+                    text-align:center;border:1px solid rgba(255,255,255,0.1);">
+            <div style="font-size:0.8rem;color:#94a3b8;">{html.escape(t)}</div>
+            <div style="font-size:1.2rem;font-weight:600;">{html.escape(format_price(prices.get(t), t))}</div>
+            <div style="font-size:0.85rem;">{change_html}</div>
+            <div style="font-size:0.65rem;color:#64748b;">{src}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+def render_price_chart(ticker: str, history: List[Dict], height: int = 400):
+    if not history:
+        st.info(f"No price history for {ticker} yet")
+        return
+    df = pd.DataFrame(history)
+    fig = go.Figure(go.Scatter(x=df["time"], y=df["price"], mode="lines+markers", name=ticker,
+                               line=dict(color="#6366f1", width=2)))
+    fig.update_layout(title=f"{ticker} — fetched prices", xaxis_title="Time (UTC)",
+                      yaxis_title="Price (local currency)", height=height,
+                      template="plotly_dark", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_performance_metrics(pipeline):
+    m = pipeline.get_performance_metrics()
+    if not m:
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total runs", f"{m['total_runs']}")
+    c2.metric("Avg time", f"{m['avg_computation_time']:.1f}s")
+    c3.metric("Sim vs hist variance gap", f"{m['avg_variance_reduction'] * 100:.1f}%")
+
+
+def _risk_frame(tickers: List[str], risk_metrics: Dict) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        r = risk_metrics.get(t)
+        if not r:
+            continue
+        rows.append({
+            "Asset": t,
+            "Volatility": safe_float(r.get("volatility")) * 100,
+            "Drift": safe_float(r.get("expected_return")) * 100,
+            "Sharpe": safe_float(r.get("sharpe")),
+            "VaR": safe_float(r.get("var_95")) * 100,
+            "AvgDD": safe_float(r.get("max_drawdown")) * 100,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_risk_charts(tickers: List[str], risk_metrics: Dict):
+    df = _risk_frame(tickers, risk_metrics)
+    if df.empty:
+        return
+    var_abs = df["VaR"].abs().fillna(0)
+    sizes = 12 + 30 * var_abs / (var_abs.max() if var_abs.max() > 0 else 1)  # always positive
+
+    fig = make_subplots(rows=1, cols=3, subplot_titles=(
+        "Vol vs drift (bubble = daily VaR)", "Daily VaR 95%", "Avg drawdown per path"))
+    fig.add_trace(go.Scatter(
+        x=df["Volatility"], y=df["Drift"], mode="markers+text", text=df["Asset"],
+        textposition="top center",
+        marker=dict(size=sizes, color=df["Sharpe"], colorscale="RdYlGn", showscale=True,
+                    colorbar=dict(title="Sharpe", x=0.3)),
+        name="Assets"), row=1, col=1)
+    fig.add_trace(go.Bar(x=df["Asset"], y=df["VaR"], marker_color="#ef4444", name="Daily VaR"), row=1, col=2)
+    fig.add_trace(go.Bar(x=df["Asset"], y=df["AvgDD"], marker_color="#f59e0b", name="Avg drawdown"), row=1, col=3)
+    fig.update_xaxes(title_text="Volatility % (ann.)", row=1, col=1)
+    fig.update_yaxes(title_text="Drift % (ann.)", row=1, col=1)
+    fig.update_yaxes(title_text="%", row=1, col=2)
+    fig.update_yaxes(title_text="%", row=1, col=3)
+    fig.update_layout(height=420, template="plotly_dark", showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def screen_signal(metrics: Dict) -> Tuple[str, str]:
+    sharpe = safe_float(metrics.get("sharpe"))
+    var = safe_float(metrics.get("var_95"))
+    dd = safe_float(metrics.get("max_drawdown"))
+    if not np.isfinite(sharpe):
+        return "⚪ n/a", "missing Sharpe"
+    v = var if np.isfinite(var) else -1.0
+    if np.isfinite(dd) and dd < -0.25:
+        return "🔴 Weak", "deep average drawdown"
+    if sharpe > 1.5 and v > -0.02:
+        return "🟢 Strong", "high Sharpe, contained daily VaR"
+    if sharpe > 0.8 and v > -0.03:
+        return "🟡 Positive", "good Sharpe"
+    if sharpe > 0.2 and v > -0.04:
+        return "🟠 Neutral", "moderate Sharpe"
+    return "🔴 Weak", "low Sharpe or large daily VaR"
+
+
+def render_signals(tickers: List[str], risk_metrics: Dict):
+    rows = []
+    for t in tickers:
+        m = risk_metrics.get(t)
+        if not m:
+            continue
+        signal, reason = screen_signal(m)
+        rows.append({"Asset": t, "Screen": signal, "Why": reason,
+                     "Sharpe": f"{safe_float(m.get('sharpe')):.2f}",
+                     "Daily VaR 95%": f"{safe_float(m.get('var_95')) * 100:.2f}%"})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("Mechanical screen on simulated Sharpe / VaR / drawdown. The simulated drift comes from "
+                   "recent history, so this mostly reflects past performance. Not a recommendation.")
 
 
 class LiveDashboard:
-    """
-    Real-time dashboard component for streaming updates
-    """
-    
+    """Backward-compatible wrapper. Uses real fetched prices (cached by the fetcher)."""
+
     def __init__(self, pipeline):
         self.pipeline = pipeline
-        self.is_running = False
-        self.update_thread = None
+        self.history: Dict[str, list] = {}
         self.last_update = None
-        
-    def start(self):
-        """Start the live dashboard"""
-        self.is_running = True
-        if self.update_thread is None or not self.update_thread.is_alive():
-            self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
-            self.update_thread.start()
-    
-    def stop(self):
-        """Stop the live dashboard"""
         self.is_running = False
-        
-    def _update_loop(self):
-        """Background update loop"""
-        while self.is_running:
-            self.last_update = datetime.now()
-            time.sleep(1)  # Update every second
-    
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def refresh(self, tickers: List[str], force: bool = False) -> Dict[str, float]:
+        prices = self.pipeline.data_fetcher.get_current_prices(list(tickers), force_refresh=force)
+        now = datetime.now(timezone.utc)
+        self.last_update = now
+        for t, p in prices.items():
+            h = self.history.setdefault(t, [])
+            h.append({"time": now, "price": p})
+            del h[:-500]
+        return prices
+
     def render_price_ticker(self, tickers: List[str]):
-        """Render live price ticker"""
-        prices = self.pipeline.get_live_prices()
-        
+        prices = self.refresh(tickers)
         if not prices:
-            st.info("Waiting for live data...")
+            st.info("No prices available — check API keys or refresh")
             return
-        
-        cols = st.columns(min(len(tickers), 6))
-        for i, ticker in enumerate(tickers[:6]):
-            if ticker in prices:
-                price = prices[ticker]
-                history = self.pipeline.get_price_history(ticker)
-                
-                # Calculate change
-                change = 0
-                if len(history) >= 2:
-                    change = ((history[-1]['price'] - history[-2]['price']) / history[-2]['price']) * 100
-                
-                color = "#10b981" if change >= 0 else "#ef4444"
-                arrow = "↑" if change >= 0 else "↓"
-                
-                with cols[i]:
-                    st.markdown(f"""
-                    <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 1rem; text-align: center; border: 1px solid rgba(255,255,255,0.1);">
-                        <div style="font-size: 0.8rem; color: #94a3b8;">{ticker}</div>
-                        <div style="font-size: 1.5rem; font-weight: 600;">${price:.2f}</div>
-                        <div style="font-size: 1rem; color: {color};">{arrow} {change:+.2f}%</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-    
+        render_price_cards(tickers, prices, self.history, self.pipeline.data_fetcher.price_sources)
+
     def render_price_chart(self, ticker: str, height: int = 400):
-        """Render live price chart for a ticker"""
-        history = self.pipeline.get_price_history(ticker)
-        
-        if not history:
-            st.info(f"No history data for {ticker}")
-            return
-        
-        df = pd.DataFrame(history)
-        
-        fig = go.Figure()
-        
-        # Price line
-        fig.add_trace(go.Scatter(
-            x=df['time'],
-            y=df['price'],
-            mode='lines',
-            name=ticker,
-            line=dict(color='#6366f1', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(99, 102, 241, 0.1)'
-        ))
-        
-        # Moving average
-        if len(df) > 20:
-            ma = df['price'].rolling(20).mean()
-            fig.add_trace(go.Scatter(
-                x=df['time'],
-                y=ma,
-                mode='lines',
-                name='MA(20)',
-                line=dict(color='#8b5cf6', width=1, dash='dash')
-            ))
-        
-        fig.update_layout(
-            title=f"{ticker} Live Price",
-            xaxis_title="Time",
-            yaxis_title="Price ($)",
-            height=height,
-            template='plotly_dark',
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
+        render_price_chart(ticker, self.history.get(ticker, []), height)
+
     def render_performance_metrics(self):
-        """Render performance metrics"""
-        metrics = self.pipeline.get_performance_metrics()
-        
-        if not metrics:
-            return
-        
-        cols = st.columns(4)
-        metrics_data = [
-            ("Total Runs", f"{metrics['total_runs']}"),
-            ("Avg Time", f"{metrics['avg_computation_time']:.1f}s"),
-            ("Variance Reduction", f"{metrics['avg_variance_reduction']*100:.1f}%")
-        ]
-        
-        for col, (label, value) in zip(cols, metrics_data):
-            with col:
-                st.metric(label, value)
-    
+        render_performance_metrics(self.pipeline)
+
     def render_heatmap(self, tickers: List[str], risk_metrics: Dict):
-        """Render risk heatmap"""
-        if not risk_metrics:
-            return
-        
-        data = []
-        for ticker in tickers:
-            if ticker in risk_metrics:
-                risk = risk_metrics[ticker]
-                data.append({
-                    'Asset': ticker,
-                    'VaR': risk.get('var_95', 0) * 100,
-                    'Volatility': risk.get('volatility', 0) * 100,
-                    'Sharpe': risk.get('sharpe', 0),
-                    'Drawdown': risk.get('max_drawdown', 0) * 100
-                })
-        
-        if not data:
-            return
-        
-        df = pd.DataFrame(data)
-        
-        fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=("Risk-Return", "VaR & Drawdown")
-        )
-        
-        # Risk-Return scatter
-        fig.add_trace(go.Scatter(
-            x=df['Volatility'],
-            y=df['Sharpe'],
-            mode='markers+text',
-            text=df['Asset'],
-            textposition='top center',
-            marker=dict(
-                size=df['VaR'] * 2,
-                color=df['Sharpe'],
-                colorscale='RdYlGn',
-                showscale=True,
-                colorbar=dict(title="Sharpe Ratio")
-            ),
-            name='Risk-Return'
-        ), row=1, col=1)
-        
-        # VaR & Drawdown bar chart
-        fig.add_trace(go.Bar(
-            x=df['Asset'],
-            y=df['VaR'],
-            name='VaR',
-            marker_color='#ef4444'
-        ), row=1, col=2)
-        
-        fig.add_trace(go.Bar(
-            x=df['Asset'],
-            y=df['Drawdown'],
-            name='Drawdown',
-            marker_color='#f59e0b'
-        ), row=1, col=2)
-        
-        fig.update_layout(
-            height=400,
-            template='plotly_dark',
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
+        render_risk_charts(tickers, risk_metrics)
+
     def render_recommendations(self, risk_metrics: Dict):
-        """Render AI-powered recommendations"""
-        if not risk_metrics:
-            return
-        
-        recommendations = []
-        
-        for ticker, metrics in risk_metrics.items():
-            sharpe = metrics.get('sharpe', 0)
-            var = metrics.get('var_95', 0)
-            drawdown = metrics.get('max_drawdown', 0)
-            
-            # Generate recommendation
-            if sharpe > 1.5 and var > -0.02:
-                signal = "🟢 STRONG BUY"
-                details = "Excellent risk-adjusted returns"
-            elif sharpe > 0.8 and var > -0.03:
-                signal = "🟡 BUY"
-                details = "Good risk-return profile"
-            elif sharpe > 0.2 and var > -0.04:
-                signal = "🟠 HOLD"
-                details = "Moderate performance"
-            else:
-                signal = "🔴 SELL/REDUCE"
-                details = "Poor risk-adjusted returns"
-            
-            if drawdown < -0.3:
-                signal = "🔴 SELL/REDUCE"
-                details = "High drawdown risk"
-            
-            recommendations.append({
-                'Asset': ticker,
-                'Signal': signal,
-                'Details': details,
-                'Sharpe': f"{sharpe:.2f}",
-                'VaR': f"{var*100:.1f}%"
-            })
-        
-        df_rec = pd.DataFrame(recommendations)
-        st.dataframe(df_rec, use_container_width=True, hide_index=True)
+        render_signals(list(risk_metrics), risk_metrics)

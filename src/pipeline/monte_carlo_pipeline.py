@@ -1,5 +1,5 @@
 """
-Monte Carlo Pipeline with real-time updates
+Monte Carlo Pipeline
 """
 
 import logging
@@ -15,6 +15,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+PERCENTILES = (5, 25, 50, 75, 95)
+
 
 class MonteCarloPipeline:
     def __init__(
@@ -25,6 +27,8 @@ class MonteCarloPipeline:
         seq_len: int = 60,
         use_gan: bool = False,
         use_live_data: bool = True,
+        n_steps: int = 60,
+        gan_checkpoint: Optional[str] = None,
     ):
         self.n_assets = n_assets
         self.n_simulations = n_simulations
@@ -32,12 +36,13 @@ class MonteCarloPipeline:
         self.seq_len = seq_len
         self.use_gan = use_gan
         self.use_live_data = use_live_data
+        self.n_steps = n_steps
+        self.gan_checkpoint = gan_checkpoint  # remembered so run_simulation can (re)load it
 
         from src.pipeline.data_fetcher import get_data_fetcher
         from src.pipeline.risk.metrics import RiskCalculator
         from src.pipeline.risk.confidence import ConfidenceIntervalCalculator
 
-        # shared, cached fetcher: one cache + one rate limiter for the whole app
         self.data_fetcher = get_data_fetcher(use_live_simulation=use_live_data)
         self.risk_calc = RiskCalculator()
         self.ci_calc = ConfidenceIntervalCalculator()
@@ -62,13 +67,15 @@ class MonteCarloPipeline:
     # ------------------------------------------------------------
     def load_models(self, n_assets: Optional[int] = None, checkpoint_path: Optional[str] = None):
         """
-        Build GAN models. An UNTRAINED generator emits garbage, so the GAN is only used
-        when a trained checkpoint ({'generator': state_dict, 'discriminator': state_dict}) is loaded.
+        Build GAN models. An UNTRAINED generator emits garbage, so the GAN is only used when a trained
+        checkpoint ({'generator': state_dict, 'discriminator': state_dict}) loads successfully.
+        A checkpoint trained for k assets only fits a run with exactly k assets.
         """
         if not self.use_gan:
             return
         if n_assets:
             self.n_assets = n_assets
+        checkpoint_path = checkpoint_path or self.gan_checkpoint
         try:
             from src.pipeline.dfmgan.generator import (
                 DFMGANConfig, ConditionalMCGenerator, TimeGANDiscriminator, PathFilter)
@@ -91,12 +98,12 @@ class MonteCarloPipeline:
                 self.generator = None
                 self.use_gan = False
         except Exception as e:
-            logger.warning(f"Could not load GAN models: {e}")
+            logger.warning(f"Could not load GAN models ({e}) -> falling back to GBM Monte Carlo")
             self.generator = None
             self.use_gan = False
 
     # ------------------------------------------------------------
-    # LIVE UPDATES (explicit opt-in; no longer triggered by every simulation)
+    # LIVE UPDATES (explicit opt-in; the fetcher's "live" feed is a random walk, not market data)
     # ------------------------------------------------------------
     def start_live_updates(self, tickers: List[str]):
         if not self.use_live_data or self.is_running:
@@ -166,7 +173,6 @@ class MonteCarloPipeline:
         cov = self._estimate_covariance_matrix(returns)
 
         jump_prob, jump_mean, jump_std = 0.05, -0.02, 0.03
-        # compensate so jumps don't add a hidden negative drift on top of mu
         jump_comp = jump_prob * (np.exp(jump_mean + 0.5 * jump_std ** 2) - 1)
 
         L = np.linalg.cholesky(cov)
@@ -182,13 +188,13 @@ class MonteCarloPipeline:
         return paths
 
     def _filter_paths_advanced(self, paths: np.ndarray, returns: pd.DataFrame) -> np.ndarray:
-        """Select the most 'historically plausible' paths. For display/sampling only —
+        """Select the most 'historically plausible' paths. Display sample only —
         do NOT compute risk from these: the filter removes the tails."""
         n_paths, n_steps = len(paths), paths.shape[1]
         k = max(1, int(n_paths * self.filter_top_k))
 
         final_returns = paths[:, -1, :] / (paths[:, 0, :] + 1e-8) - 1
-        hist_horizon = (1 + returns.mean().values) ** (n_steps - 1) - 1  # same scale as final_returns
+        hist_horizon = (1 + returns.mean().values) ** (n_steps - 1) - 1
         scores = np.abs(final_returns - hist_horizon).mean(axis=1)
 
         path_vol = np.std(np.diff(np.log(paths + 1e-8), axis=1), axis=1).mean(axis=1)
@@ -226,8 +232,7 @@ class MonteCarloPipeline:
                 "No historical data available. Provider errors: "
                 f"{getattr(self.data_fetcher, 'last_errors', {})}")
 
-        # Columns are what we really got. Re-key everything on them so a failed ticker
-        # can never shift another ticker's data.
+        # Re-key on the columns we really got, so a failed ticker can never shift another's data
         available = [t for t in tickers if t in historical.columns]
         missing = [t for t in tickers if t not in historical.columns]
         historical = historical[available]
@@ -246,7 +251,7 @@ class MonteCarloPipeline:
         for t in tickers:
             hist_last = float(historical[t].iloc[-1])
             cur = current_prices.get(t)
-            # use the live price only if it is consistent with the history (same currency/scale)
+            # use the live price only if consistent with history (same currency/scale)
             last_prices.append(cur if cur and 0.75 < cur / hist_last < 1.25 else hist_last)
         last_prices = np.array(last_prices)
 
@@ -261,20 +266,24 @@ class MonteCarloPipeline:
             with torch.no_grad():
                 paths = self.generator(hist_tensor, self.n_simulations).cpu().numpy()
         else:
-            paths = self._simulate_gbm_paths(returns, last_prices, n_steps=60)
+            paths = self._simulate_gbm_paths(returns, last_prices, n_steps=self.n_steps)
+
+        n_paths, n_steps_out = paths.shape[0], paths.shape[1]
 
         cb(50, "Filtering paths...")
         filtered_paths = self._filter_paths_advanced(paths, returns)
 
-        # Statistics use ALL paths (filtered ones have artificially thin tails)
+        # Statistics use ALL paths (the filtered ones have artificially thin tails)
         cb(60, "Computing expected prices...")
-        expected_prices, confidence_intervals, price_distributions = {}, {}, {}
+        expected_prices, confidence_intervals, price_distributions, path_percentiles = {}, {}, {}, {}
         for i, ticker in enumerate(tickers):
             final = paths[:, -1, i]
             expected_prices[ticker] = float(np.mean(final))
             confidence_intervals[ticker] = [float(np.percentile(final, 2.5)),
                                             float(np.percentile(final, 97.5))]
             price_distributions[ticker] = final.tolist()
+            bands = np.percentile(paths[:, :, i], PERCENTILES, axis=0)
+            path_percentiles[ticker] = {str(p): b.tolist() for p, b in zip(PERCENTILES, bands)}
 
         cb(70, "Calculating risk metrics...")
         paths_returns = np.diff(np.log(paths + 1e-8), axis=1)
@@ -289,14 +298,15 @@ class MonteCarloPipeline:
 
             pp = paths[:, :, i]
             peak = np.maximum.accumulate(pp, axis=1)
-            max_dd = float(np.min((pp - peak) / (peak + 1e-8)))
+            dd_per_path = np.min((pp - peak) / (peak + 1e-8), axis=1)
 
             risk_metrics[ticker] = {
                 "var_95": float(var_95), "cvar_95": float(cvar_95),
                 "expected_return": float(exp_ret), "volatility": float(vol),
                 "sharpe": float((exp_ret - 0.02) / (vol + 1e-8)),
                 "sortino": float((exp_ret - 0.02) / (downside + 1e-8)),
-                "max_drawdown": max_dd,
+                "max_drawdown": float(np.mean(dd_per_path)),     # average path
+                "worst_drawdown": float(np.min(dd_per_path)),    # worst single path
             }
 
         cb(80, "Fetching options data...")
@@ -332,17 +342,20 @@ class MonteCarloPipeline:
                 "timestamp": datetime.now().isoformat(),
                 "tickers": tickers,
                 "missing_tickers": missing,
-                "n_simulations": self.n_simulations,
+                "n_simulations": int(n_paths),
                 "filtered_paths": len(filtered_paths),
                 "computation_time": computation_time,
                 "data_source": self.data_fetcher.get_data_source_info(),
                 "use_gan": self.use_gan,
                 "use_live_data": self.use_live_data,
             },
+            "horizon_days": int(n_steps_out - 1),
+            "start_prices": {t: float(p) for t, p in zip(tickers, last_prices)},
             "current_prices": current_prices,
             "expected_prices": expected_prices,
             "confidence_intervals": confidence_intervals,
             "price_distributions": price_distributions,
+            "path_percentiles": path_percentiles,
             "risk_metrics": risk_metrics,
             "option_prices": option_prices,
             "portfolio_stats": portfolio_stats,
