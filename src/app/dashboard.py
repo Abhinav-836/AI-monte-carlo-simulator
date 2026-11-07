@@ -63,6 +63,10 @@ CSS = """
   border-radius: 12px; margin: 1.8rem 0 1.2rem 0; color: white; font-weight: 600; font-size: 1.2rem; }
 .stButton > button { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; border: none;
   border-radius: 12px; padding: 0.5rem 1rem; font-weight: 600; }
+/* Keep the label white on hover/focus: the theme's primary colour is the
+   same indigo as the button, so Streamlit's default hover text vanished. */
+.stButton > button:hover, .stButton > button:focus, .stButton > button:active,
+.stButton > button:focus:not(:active) { color: white; border: none; filter: brightness(1.08); }
 </style>
 """
 
@@ -511,12 +515,6 @@ def run_dashboard():
 
         run_button = st.button("🚀 RUN SIMULATION", use_container_width=True, type="primary")
         st.button("🔄 Refresh data", on_click=_request_refresh, use_container_width=True)
-        if st.button("🧪 Test AI connection", use_container_width=True):
-            if LlamaExplainer is None:
-                st.error(f"Explainer import failed: {_EXPLAINER_ERROR}")
-            else:
-                ok, msg = LlamaExplainer().check_connection()
-                (st.success if ok else st.error)(msg)
         st.caption(f"Tracking {len(stocks)} assets")
 
     # ---------------- PRICES ----------------
