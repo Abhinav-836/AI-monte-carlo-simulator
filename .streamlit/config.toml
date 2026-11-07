@@ -1,0 +1,10 @@
+# The app paints its own dark background (see CSS in src/app/dashboard.py).
+# Without a theme here Streamlit follows each visitor's light/dark setting,
+# and in light mode it draws dark text on that dark background, so prices,
+# headings, captions and widget labels were nearly invisible.
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#e2e8f0"
