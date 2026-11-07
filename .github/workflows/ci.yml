@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (CPU-only PyTorch)
+        run: |
+          python -m pip install --upgrade pip
+          # The CPU wheel is ~200 MB instead of ~2 GB of CUDA libraries.
+          pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Check installed packages are compatible
+        run: pip check
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Dashboard imports cleanly
+        run: python -c "import ast, pathlib; ast.parse(pathlib.Path('src/app/dashboard.py').read_text())"

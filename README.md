@@ -1,5 +1,7 @@
 # 🚀 AI-Powered Monte Carlo Stock Simulator
 
+[![CI](https://github.com/Abhinav-836/AI-monte-carlo-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/Abhinav-836/AI-monte-carlo-simulator/actions/workflows/ci.yml)
+
 Monte Carlo simulation of global stock prices with optional generative models (WGAN-GP "DFMGAN"),
 prediction-enhanced variance reduction (PEMC), portfolio optimisation, risk analytics and an
 optional LLM that explains the results.
